@@ -1574,71 +1574,78 @@ export default function Home() {
           }
         }
         
-        // Auto-save calculated rebate records to Neon Postgres
+        // Auto-save calculated rebate records to Neon Postgres (Only for VISKOU invoices)
         try {
-          const rebateRecordsToSave = [];
-          
-          invoiceForm.items.forEach(item => {
-            if (parseFloat(item.rate || 0) < 0) return; // Skip discount rows
-            
-            // Pick cleanest candidate model code (avoiding generic fallback 'Default Item')
-            let modelCode = '';
-            if (item.description && item.description !== 'Default Item' && item.description.trim().length > 0) {
-              modelCode = item.description.trim();
-            } else if (item.item_code && item.item_code !== 'Default Item' && item.item_code.trim().length > 0) {
-              modelCode = item.item_code.trim();
-            } else {
-              modelCode = (item.description || item.item_code || 'ITEM').trim();
-            }
+          const supplierName = (selectedSupplierObject?.supplier_name || selectedSupplierObject?.name || invoiceForm?.supplier || supplierQuery || '').toLowerCase();
+          const isViskou = supplierName.includes('viskou');
 
-            const upperCode = modelCode.toUpperCase();
-            let rebatePct = 0;
+          if (!isViskou) {
+            logToConsole(`ℹ Skipping rebate records: Rebate only applies to supplier VISKOU (current supplier: "${selectedSupplierObject?.supplier_name || invoiceForm.supplier || 'Non-VISKOU'}").`, 'info');
+          } else {
+            const rebateRecordsToSave = [];
             
-            if (upperCode.startsWith('RG')) {
-              rebatePct = 0.05;
-            } else if (upperCode.startsWith('VS')) {
-              rebatePct = 0.10;
-            } else if (upperCode.startsWith('DS') || upperCode.startsWith('IDS') || upperCode.startsWith('CS')) {
-              const isInException = rebateExceptionList.some(ex => {
-                const cleanEx = String(ex || '').toUpperCase().trim();
-                return cleanEx === upperCode || upperCode.includes(cleanEx) || cleanEx.includes(upperCode);
-              });
-              rebatePct = isInException ? 0.08 : 0.16;
-            } else {
-              rebatePct = 0;
-            }
-            
-            const qty = parseFloat(item.qty || 1);
-            const rate = parseFloat(item.rate || 0);
-            const realRate = item.real_rate !== undefined && item.real_rate !== null ? parseFloat(item.real_rate) : rate;
-            const rebateAmt = qty * realRate * rebatePct;
-            
-            if (rebateAmt > 0 || rebatePct > 0) {
-              rebateRecordsToSave.push({
-                date: invoiceForm.date || new Date().toISOString().split('T')[0],
-                invoice_no: finalDocName || invoiceForm.invoice_number,
-                item_model_code: modelCode,
-                quantity: qty,
-                rate: rate,
-                real_rate: realRate,
-                rebate_percentage: rebatePct,
-                rebate_amount: rebateAmt,
-                company_profile: activeProfileName,
-                supplier_invoice_no: invoiceForm.invoice_number
-              });
-            }
-          });
+            invoiceForm.items.forEach(item => {
+              if (parseFloat(item.rate || 0) < 0) return; // Skip discount rows
+              
+              // Pick cleanest candidate model code (avoiding generic fallback 'Default Item')
+              let modelCode = '';
+              if (item.description && item.description !== 'Default Item' && item.description.trim().length > 0) {
+                modelCode = item.description.trim();
+              } else if (item.item_code && item.item_code !== 'Default Item' && item.item_code.trim().length > 0) {
+                modelCode = item.item_code.trim();
+              } else {
+                modelCode = (item.description || item.item_code || 'ITEM').trim();
+              }
 
-          if (rebateRecordsToSave.length > 0) {
-            logToConsole(`Auto-saving ${rebateRecordsToSave.length} rebate record(s) to Neon DB for profile "${activeProfileName}"...`, 'info');
-            const rebRes = await fetch('/api/rebates/records', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ records: rebateRecordsToSave })
+              const upperCode = modelCode.toUpperCase();
+              let rebatePct = 0;
+              
+              if (upperCode.startsWith('RG')) {
+                rebatePct = 0.05;
+              } else if (upperCode.startsWith('VS')) {
+                rebatePct = 0.10;
+              } else if (upperCode.startsWith('DS') || upperCode.startsWith('IDS') || upperCode.startsWith('CS')) {
+                const isInException = rebateExceptionList.some(ex => {
+                  const cleanEx = String(ex || '').toUpperCase().trim();
+                  return cleanEx === upperCode || upperCode.includes(cleanEx) || cleanEx.includes(upperCode);
+                });
+                rebatePct = isInException ? 0.08 : 0.16;
+              } else {
+                rebatePct = 0;
+              }
+              
+              const qty = parseFloat(item.qty || 1);
+              const rate = parseFloat(item.rate || 0);
+              const realRate = item.real_rate !== undefined && item.real_rate !== null ? parseFloat(item.real_rate) : rate;
+              const rebateAmt = qty * realRate * rebatePct;
+              
+              if (rebateAmt > 0 || rebatePct > 0) {
+                rebateRecordsToSave.push({
+                  date: invoiceForm.date || new Date().toISOString().split('T')[0],
+                  invoice_no: finalDocName || invoiceForm.invoice_number,
+                  item_model_code: modelCode,
+                  quantity: qty,
+                  rate: rate,
+                  real_rate: realRate,
+                  rebate_percentage: rebatePct,
+                  rebate_amount: rebateAmt,
+                  company_profile: activeProfileName,
+                  supplier_invoice_no: invoiceForm.invoice_number
+                });
+              }
             });
-            const rebData = await rebRes.json();
-            if (rebData.success) {
-              logToConsole(`✓ ${rebData.message}`, 'success');
+
+            if (rebateRecordsToSave.length > 0) {
+              logToConsole(`Auto-saving ${rebateRecordsToSave.length} rebate record(s) to Neon DB for profile "${activeProfileName}"...`, 'info');
+              const rebRes = await fetch('/api/rebates/records', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ records: rebateRecordsToSave })
+              });
+              const rebData = await rebRes.json();
+              if (rebData.success) {
+                logToConsole(`✓ ${rebData.message}`, 'success');
+              }
             }
           }
         } catch (rebErr) {
@@ -1668,6 +1675,12 @@ export default function Home() {
   // Live Rebate Item Evaluator
   function getItemRebateInfo(item) {
     if (parseFloat(item.rate || 0) < 0) return { pct: 0, amt: 0, label: 'Discount Row' };
+
+    // Rebates strictly apply only to supplier VISKOU invoices
+    const currentSupplier = (selectedSupplierObject?.supplier_name || selectedSupplierObject?.name || invoiceForm?.supplier || supplierQuery || '').toLowerCase();
+    if (!currentSupplier.includes('viskou')) {
+      return { pct: 0, amt: 0, label: 'Non-VISKOU' };
+    }
 
     let modelCode = '';
     if (item.description && item.description !== 'Default Item' && item.description.trim().length > 0) {
