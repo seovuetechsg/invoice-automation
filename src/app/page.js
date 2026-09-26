@@ -1306,6 +1306,76 @@ export default function Home() {
       return;
     }
     
+    // Check for missing items in ERPNext and prompt for auto-creation
+    const missingItems = [];
+    for (const line of invoiceForm.items) {
+      const isDiscount = parseFloat(line.rate || 0) < 0 || (line.description || '').toLowerCase().includes('discount');
+      if (isDiscount) continue;
+      
+      const itemCode = (line.item_code || line.description || '').trim();
+      if (!itemCode || itemCode === 'Default Item') continue;
+
+      const erpItemMatch = itemsList.find(it => (it.item_code || it.name || '').toLowerCase() === itemCode.toLowerCase());
+      if (!erpItemMatch && !missingItems.includes(itemCode)) {
+        missingItems.push(itemCode);
+      }
+    }
+
+    if (missingItems.length > 0) {
+      const confirmCreate = confirm(`⚠️ The following item(s) are NOT found in ERPNext:\n\n${missingItems.map(m => `• ${m}`).join('\n')}\n\nWould you like the app to automatically create them as new Products before syncing?`);
+      if (confirmCreate) {
+        logToConsole(`Auto-creating ${missingItems.length} missing item(s) in ERPNext...`, 'info');
+        let createdAny = false;
+        
+        for (const missingCode of missingItems) {
+          try {
+            const newItemPayload = {
+              item_code: missingCode,
+              item_name: missingCode,
+              item_group: "Product", // User requested 'Product'
+              stock_uom: "Nos",
+              is_stock_item: 1
+            };
+            
+            // Try to create the item
+            const createRes = await erpRequest('/api/resource/Item', 'POST', newItemPayload);
+            if (createRes && createRes.data) {
+              logToConsole(`✓ Successfully created item: ${missingCode}`, 'success');
+              // Append to local state cache immediately so it passes mapping later
+              setItemsList(prev => [...prev, createRes.data]);
+              createdAny = true;
+            }
+          } catch (createErr) {
+            // Fallback for strict Item Group naming in standard ERPNext
+            if (createErr.message.includes('Item Group')) {
+               logToConsole(`Retrying ${missingCode} with item_group="Products"...`, 'warn');
+               try {
+                 const fallbackPayload = { item_code: missingCode, item_name: missingCode, item_group: "Products", stock_uom: "Nos", is_stock_item: 1 };
+                 const fbRes = await erpRequest('/api/resource/Item', 'POST', fallbackPayload);
+                 if (fbRes && fbRes.data) {
+                   logToConsole(`✓ Successfully created item: ${missingCode}`, 'success');
+                   setItemsList(prev => [...prev, fbRes.data]);
+                   createdAny = true;
+                 }
+               } catch (fbErr) {
+                 alert(`Failed to create item ${missingCode}. Check Item Group or mandatory fields in ERPNext.`);
+                 return;
+               }
+            } else {
+              alert(`Failed to create item ${missingCode}: ${createErr.message}`);
+              return;
+            }
+          }
+        }
+        if (createdAny) {
+           logToConsole(`✓ Auto-creation complete. Proceeding with sync...`, 'success');
+        }
+      } else {
+        logToConsole(`Sync cancelled by user (pending missing items).`, 'warn');
+        return;
+      }
+    }
+    
 
     
     const docType = activeProfile.sync_doctype || 'Purchase Order';
@@ -1760,7 +1830,7 @@ export default function Home() {
 
   // Item Autocomplete matching algorithm
   function findMatchingItemCode(desc) {
-    if (!desc || itemsList.length === 0) return 'Default Item';
+    if (!desc || itemsList.length === 0) return desc || 'Default Item';
     
     // Sanitize query: standardize dashes, zero-width spaces, trim spaces and leading/trailing punctuation
     const query = desc
@@ -1881,7 +1951,8 @@ export default function Home() {
       return best.item.item_code || best.item.name;
     }
     
-    return parserSettings.defaultItem || '';
+    // Return the raw model/description to trigger the auto-create missing item logic
+    return desc ? desc.trim() : (parserSettings.defaultItem || '');
   }
   async function loadUnpaidInvoices(supplierId) {
     setLoadingInvoices(true);
@@ -3410,7 +3481,28 @@ export default function Home() {
                                   />
                                 </div>
                                 {(() => {
+                                  const isDiscount = parseFloat(item.rate || 0) < 0 || (item.description || '').toLowerCase().includes('discount');
+                                  if (isDiscount) return null;
+                                  
                                   const erpItemMatch = itemsList.find(it => (it.item_code || it.name || '').toLowerCase() === (item.item_code || '').toLowerCase());
+                                  
+                                  if (!erpItemMatch && item.item_code && item.item_code !== 'Default Item') {
+                                    return (
+                                      <div style={{ 
+                                        fontSize: '10px', 
+                                        color: '#fbbf24', 
+                                        display: 'flex', 
+                                        alignItems: 'center', 
+                                        gap: '4px', 
+                                        marginTop: '2px',
+                                        fontWeight: '500',
+                                        lineHeight: '1.2'
+                                      }}>
+                                        ⚠️ New Item (Not in ERPNext)
+                                      </div>
+                                    );
+                                  }
+
                                   const lastPurchaseRate = erpItemMatch?.last_purchase_rate || 0;
                                   const effectiveRealRate = item.real_rate !== undefined ? parseFloat(item.real_rate) : parseFloat(item.rate || 0);
                                   
