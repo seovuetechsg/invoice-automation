@@ -1102,12 +1102,14 @@ export default function Home() {
       if (isDiscountText || isNegative) {
         discountAmount += Math.abs(amount || rate);
       } else {
+        const matchResult = findMatchingItemCode(i.description || "Line Item");
         filteredItems.push({
           description: i.description || "Line Item",
           qty: qty,
           rate: rate,
           amount: amount,
-          item_code: findMatchingItemCode(i.description || "Line Item"),
+          item_code: matchResult.item_code,
+          match_confidence: matchResult.match_confidence,
           serial_nos: i.serial_nos || ""
         });
       }
@@ -1212,12 +1214,14 @@ export default function Home() {
         if (isDiscount) {
           parsedData.discount_amount = (parsedData.discount_amount || 0) + Math.abs(amount || rate);
         } else if (desc.length > 2 && qty > 0 && rate > 0) {
+          const matchResult = findMatchingItemCode(desc);
           parsedData.items.push({
             description: desc,
             qty,
             rate,
             amount,
-            item_code: findMatchingItemCode(desc)
+            item_code: matchResult.item_code,
+            match_confidence: matchResult.match_confidence
           });
         }
       }
@@ -1830,7 +1834,8 @@ export default function Home() {
 
   // Item Autocomplete matching algorithm
   function findMatchingItemCode(desc) {
-    if (!desc || itemsList.length === 0) return desc || 'Default Item';
+    const defaultFallback = desc ? desc.trim() : (parserSettings.defaultItem || '');
+    if (!desc || itemsList.length === 0) return { item_code: defaultFallback, match_confidence: 'none' };
     
     // Sanitize query: standardize dashes, zero-width spaces, trim spaces and leading/trailing punctuation
     const query = desc
@@ -1840,7 +1845,10 @@ export default function Home() {
       .trim()
       .replace(/^[\s.,:;'"!?,]+|[\s.,:;'"!?,]+$/g, '');             // trims trailing punctuation
     
-    if (!query) return itemsList[0]?.item_code || itemsList[0]?.name || 'Default Item';
+    if (!query) {
+      const fb = itemsList[0]?.item_code || itemsList[0]?.name || defaultFallback;
+      return { item_code: fb, match_confidence: 'none' };
+    }
     
     // Levenshtein similarity calculator helper
     function getLevenshteinSimilarity(s1, s2) {
@@ -1872,25 +1880,23 @@ export default function Home() {
       return maxLen === 0 ? 1 : 1 - (distance / maxLen);
     }
 
-    // Helper to extract item code safely (falls back to ERPNext primary key name ID)
     function getItemCode(i) {
       return (i.item_code || i.name || '').toLowerCase().trim();
     }
 
-    // Helper to extract item name safely
     function getItemName(i) {
       return (i.item_name || '').toLowerCase().trim();
     }
 
-    // 1. Exact match on code (highest priority) - checks item_code and primary key name
+    // 1. Exact match on code (highest priority)
     const exactCode = itemsList.find(i => getItemCode(i) === query);
-    if (exactCode) return exactCode.item_code || exactCode.name;
+    if (exactCode) return { item_code: exactCode.item_code || exactCode.name, match_confidence: 'high' };
     
     // 2. Exact match on name (secondary priority)
     const exactName = itemsList.find(i => getItemName(i) === query);
-    if (exactName) return exactName.item_code || exactName.name;
+    if (exactName) return { item_code: exactName.item_code || exactName.name, match_confidence: 'high' };
     
-    // 3. Score all candidates using separate Code and Name metrics
+    // 3. Score all candidates
     const candidates = [];
     
     itemsList.forEach(i => {
@@ -1899,60 +1905,46 @@ export default function Home() {
       
       // -- Code matching metrics
       let codeSubScore = 0;
-      if (query.includes(code)) {
-        codeSubScore = code.length;
-      } else if (code.includes(query)) {
-        codeSubScore = query.length;
-      }
+      if (query.includes(code)) codeSubScore = code.length;
+      else if (code.includes(query)) codeSubScore = query.length;
       
       let codeTokenMatches = 0;
       const codeTokens = code.split(/[\s,._/#-]+/).filter(t => t.length >= 2);
-      codeTokens.forEach(token => {
-        if (query.includes(token)) codeTokenMatches++;
-      });
+      codeTokens.forEach(token => { if (query.includes(token)) codeTokenMatches++; });
       const codeTokenRatio = codeTokens.length > 0 ? (codeTokenMatches / codeTokens.length) : 0;
       const codeLev = getLevenshteinSimilarity(query, code);
-      
-      // Combined Code Score
       const codeScore = codeSubScore + (codeTokenRatio * 15.0) + (codeLev * 15.0);
       
       // -- Name matching metrics
       let nameSubScore = 0;
-      if (query.includes(name)) {
-        nameSubScore = name.length;
-      } else if (name.includes(query)) {
-        nameSubScore = query.length;
-      }
+      if (query.includes(name)) nameSubScore = name.length;
+      else if (name.includes(query)) nameSubScore = query.length;
       
       let nameTokenMatches = 0;
       const nameTokens = name.split(/[\s,._/#-]+/).filter(t => t.length >= 2);
-      nameTokens.forEach(token => {
-        if (query.includes(token)) nameTokenMatches++;
-      });
+      nameTokens.forEach(token => { if (query.includes(token)) nameTokenMatches++; });
       const nameTokenRatio = nameTokens.length > 0 ? (nameTokenMatches / nameTokens.length) : 0;
       const nameLev = getLevenshteinSimilarity(query, name);
-      
-      // Combined Name Score
       const nameScore = nameSubScore + (nameTokenRatio * 10.0) + (nameLev * 10.0);
       
       candidates.push({ item: i, codeScore, nameScore });
     });
     
-    // Sort candidates: Code match is absolute primary priority. Name match is tie-breaker.
     candidates.sort((a, b) => {
-      if (Math.abs(a.codeScore - b.codeScore) > 0.001) {
-        return b.codeScore - a.codeScore;
-      }
+      if (Math.abs(a.codeScore - b.codeScore) > 0.001) return b.codeScore - a.codeScore;
       return b.nameScore - a.nameScore;
     });
     
     const best = candidates[0];
-    if (best && (best.codeScore > 1.5 || best.nameScore > 1.5)) {
-      return best.item.item_code || best.item.name;
+    if (best) {
+      if (best.codeScore > 4.0 || best.nameScore > 4.0) {
+         return { item_code: best.item.item_code || best.item.name, match_confidence: 'high' };
+      } else if (best.codeScore > 1.5 || best.nameScore > 1.5) {
+         return { item_code: best.item.item_code || best.item.name, match_confidence: 'low' };
+      }
     }
     
-    // Return the raw model/description to trigger the auto-create missing item logic
-    return desc ? desc.trim() : (parserSettings.defaultItem || '');
+    return { item_code: defaultFallback, match_confidence: 'none' };
   }
   async function loadUnpaidInvoices(supplierId) {
     setLoadingInvoices(true);
@@ -3458,7 +3450,9 @@ export default function Home() {
                                     onChange={(e) => {
                                       const newItems = [...invoiceForm.items];
                                       newItems[index].description = e.target.value;
-                                      newItems[index].item_code = findMatchingItemCode(e.target.value);
+                                      const matchResult = findMatchingItemCode(e.target.value);
+                                      newItems[index].item_code = matchResult.item_code;
+                                      newItems[index].match_confidence = matchResult.match_confidence;
                                       setInvoiceForm({ ...invoiceForm, items: newItems });
                                     }}
                                     style={{ padding: '4px 8px', fontSize: '12px', flex: 1, minWidth: '110px' }}
@@ -3473,6 +3467,7 @@ export default function Home() {
                                     onChange={(e) => {
                                       const newItems = [...invoiceForm.items];
                                       newItems[index].item_code = e.target.value;
+                                      newItems[index].match_confidence = 'high'; // Assume manual selection is high confidence
                                       setInvoiceForm({ ...invoiceForm, items: newItems });
                                     }}
                                     style={{ padding: '4px 8px', fontSize: '12px', flex: 1, minWidth: '110px', border: '1px solid rgba(56, 189, 248, 0.3)' }}
@@ -3488,17 +3483,14 @@ export default function Home() {
                                   
                                   if (!erpItemMatch && item.item_code && item.item_code !== 'Default Item') {
                                     return (
-                                      <div style={{ 
-                                        fontSize: '10px', 
-                                        color: '#fbbf24', 
-                                        display: 'flex', 
-                                        alignItems: 'center', 
-                                        gap: '4px', 
-                                        marginTop: '2px',
-                                        fontWeight: '500',
-                                        lineHeight: '1.2'
-                                      }}>
+                                      <div style={{ fontSize: '10px', color: '#fbbf24', display: 'flex', alignItems: 'center', gap: '4px', marginTop: '2px', fontWeight: '500', lineHeight: '1.2' }}>
                                         ⚠️ New Item (Not in ERPNext)
+                                      </div>
+                                    );
+                                  } else if (erpItemMatch && item.match_confidence === 'low') {
+                                    return (
+                                      <div style={{ fontSize: '10px', color: '#fbbf24', display: 'flex', alignItems: 'center', gap: '4px', marginTop: '2px', fontWeight: '500', lineHeight: '1.2' }}>
+                                        ⚠️ Low Confidence Match: Please Verify
                                       </div>
                                     );
                                   }
