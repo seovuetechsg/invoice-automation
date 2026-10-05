@@ -3423,6 +3423,13 @@ export default function Home() {
                 </div>
                 
                 <div className="table-container" style={{ overflowX: 'auto', borderRadius: 'var(--radius-sm)' }}>
+                  <datalist id="erp-items-datalist">
+                    {itemsList.map((item, idx) => (
+                      <option key={idx} value={item.item_code || item.name}>
+                        {item.item_name || item.name}
+                      </option>
+                    ))}
+                  </datalist>
                   <table className="items-table" style={{ minWidth: '720px', width: '100%', borderCollapse: 'collapse' }}>
                     <thead>
                       <tr>
