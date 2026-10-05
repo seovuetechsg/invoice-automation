@@ -3309,53 +3309,34 @@ export default function Home() {
               <div className="form-group" style={{ position: 'relative' }}>
                 <label>Supplier / Party <span className="required">*</span></label>
                 <div className="autocomplete-container">
+                  <datalist id="erp-suppliers-datalist">
+                    {suppliersList.map(s => (
+                      <option key={s.name} value={s.supplier_name || s.name}>
+                        {s.name}
+                      </option>
+                    ))}
+                  </datalist>
                   <input 
                     type="text" 
                     placeholder="Search or select supplier..."
                     value={supplierQuery}
+                    list="erp-suppliers-datalist"
                     onChange={(e) => {
-                      setSupplierQuery(e.target.value);
-                      setShowSupplierDropdown(true);
-                      const q = e.target.value.toLowerCase();
-                      const filtered = suppliersList.filter(s => (s.supplier_name || s.name || "").toLowerCase().includes(q) || s.name.toLowerCase().includes(q));
-                      setSupplierSuggestions(filtered);
-                    }}
-                    onFocus={() => {
-                      if (!selectedSupplierObject) {
-                        setShowSupplierDropdown(true);
-                        setSupplierSuggestions(suppliersList);
+                      const val = e.target.value;
+                      setSupplierQuery(val);
+                      
+                      // Auto-select the full supplier object if it matches perfectly
+                      const match = suppliersList.find(s => (s.supplier_name === val || s.name === val));
+                      if (match) {
+                        setSelectedSupplierObject(match);
+                        setInvoiceForm(prev => ({ ...prev, supplier: match.name }));
+                      } else {
+                        setSelectedSupplierObject(null);
+                        setInvoiceForm(prev => ({ ...prev, supplier: val }));
                       }
                     }}
                     required
                   />
-                  {showSupplierDropdown && (
-                    <div className="autocomplete-dropdown">
-                      {suppliersList.length === 0 ? (
-                        <div className="autocomplete-item" style={{ color: 'var(--status-warn)', cursor: 'default' }}>
-                          ⚠️ No suppliers loaded. Ensure ERPNext profile is active and status is Connected.
-                        </div>
-                      ) : supplierSuggestions.length === 0 ? (
-                        <div className="autocomplete-item" style={{ color: 'var(--text-muted)', cursor: 'default' }}>
-                          No matches found.
-                        </div>
-                      ) : (
-                        supplierSuggestions.map(s => (
-                          <div 
-                            key={s.name}
-                            className="autocomplete-item"
-                            onClick={() => {
-                              setSelectedSupplierObject(s);
-                              setSupplierQuery(s.supplier_name || s.name || "");
-                              setShowSupplierDropdown(false);
-                              setInvoiceForm(prev => ({ ...prev, supplier: s.name }));
-                            }}
-                          >
-                            {s.supplier_name || s.name} <span style={{ fontSize: '10px', opacity: 0.6 }}>({s.name})</span>
-                          </div>
-                        ))
-                      )}
-                    </div>
-                  )}
                 </div>
                 <small style={{ 
                   fontSize: '11px', 
