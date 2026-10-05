@@ -1937,9 +1937,9 @@ export default function Home() {
     
     const best = candidates[0];
     if (best) {
-      if (best.codeScore > 4.0 || best.nameScore > 4.0) {
+      if (best.codeScore >= 14.0 || best.nameScore >= 14.0) {
          return { item_code: best.item.item_code || best.item.name, match_confidence: 'high' };
-      } else if (best.codeScore > 1.5 || best.nameScore > 1.5) {
+      } else if (best.codeScore >= 8.0 || best.nameScore >= 8.0) {
          return { item_code: best.item.item_code || best.item.name, match_confidence: 'low' };
       }
     }
