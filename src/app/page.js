@@ -1305,7 +1305,47 @@ export default function Home() {
       return;
     }
     
-    if (!selectedSupplierObject) {
+    let supplierRef = selectedSupplierObject;
+    
+    // Auto-create Missing Supplier Check
+    if (!supplierRef && invoiceForm.supplier) {
+      const confirmSupplier = confirm(`⚠️ The supplier "${invoiceForm.supplier}" is NOT found in ERPNext.\n\nWould you like the app to automatically create it as a new Supplier?`);
+      if (confirmSupplier) {
+        logToConsole(`Auto-creating missing supplier "${invoiceForm.supplier}" in ERPNext...`, 'info');
+        try {
+          const payload = { supplier_name: invoiceForm.supplier, supplier_group: "All Supplier Groups" };
+          const res = await erpRequest('/api/resource/Supplier', 'POST', payload);
+          if (res && res.data) {
+             logToConsole(`✓ Successfully created supplier: ${invoiceForm.supplier}`, 'success');
+             setSuppliersList(prev => [...prev, res.data]);
+             setSelectedSupplierObject(res.data);
+             alert(`Supplier "${invoiceForm.supplier}" created successfully!\n\nPlease click "Sync to ERPNext" again to continue.`);
+             return;
+          }
+        } catch (err) {
+           logToConsole(`Retrying supplier creation with group "Local"...`, 'warn');
+           try {
+             const fallbackPayload = { supplier_name: invoiceForm.supplier, supplier_group: "Local" };
+             const fbRes = await erpRequest('/api/resource/Supplier', 'POST', fallbackPayload);
+             if (fbRes && fbRes.data) {
+               logToConsole(`✓ Successfully created supplier: ${invoiceForm.supplier}`, 'success');
+               setSuppliersList(prev => [...prev, fbRes.data]);
+               setSelectedSupplierObject(fbRes.data);
+               alert(`Supplier "${invoiceForm.supplier}" created successfully!\n\nPlease click "Sync to ERPNext" again to continue.`);
+               return;
+             }
+           } catch (fbErr) {
+             alert(`Failed to create supplier. Ensure default Item Groups exist in ERPNext. Error: ${fbErr.message}`);
+             return;
+           }
+        }
+      } else {
+        logToConsole(`Sync cancelled by user (missing supplier).`, 'warn');
+        return;
+      }
+    }
+
+    if (!supplierRef) {
       alert("Supplier must be linked to an ERPNext supplier record.");
       return;
     }
