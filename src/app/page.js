@@ -227,6 +227,35 @@ export default function Home() {
     }
   }, [activeProfileName, profiles]);
 
+  // Automatically re-evaluate unmatched invoice items as itemsList batches load in the background
+  useEffect(() => {
+    if (!itemsList || itemsList.length === 0) return;
+    setInvoiceForm(curr => {
+      if (!curr.items || curr.items.length === 0) return curr;
+      let changed = false;
+      const updated = curr.items.map(line => {
+        const isDiscount = parseFloat(line.rate || 0) < 0 || (line.description || '').toLowerCase().includes('discount');
+        if (isDiscount) return line;
+        const existingMatch = findErpItemRecord(line.item_code, itemsList);
+        if (existingMatch) {
+          const canonicalCode = existingMatch.item_code || existingMatch.name;
+          if (line.item_code !== canonicalCode) {
+            changed = true;
+            return { ...line, item_code: canonicalCode };
+          }
+          return line;
+        }
+        const matchRes = findMatchingItemCode(line.description || line.item_code, itemsList);
+        if (matchRes.match_confidence !== 'none' && (matchRes.item_code !== line.item_code || matchRes.match_confidence !== line.match_confidence)) {
+          changed = true;
+          return { ...line, item_code: matchRes.item_code, match_confidence: matchRes.match_confidence };
+        }
+        return line;
+      });
+      return changed ? { ...curr, items: updated } : curr;
+    });
+  }, [itemsList]);
+
   if (!mounted) return null;
 
   // Logging Helper
@@ -526,13 +555,14 @@ export default function Home() {
         logToConsole(`Loaded ${resSup.data.length} suppliers for autocomplete cache.`, 'info');
       }
 
-      // 2. Fetch Items in sequential batches of 2000 to prevent ERPNext server timeouts
+      // 2. Fetch Items in sequential batches of 500 to prevent ERPNext server timeouts and pagination truncation
       try {
         let allItems = [];
-        let limit = 2000;
+        let limit = 500;
         let offset = 0;
         let hasMore = true;
-        const maxItemsToLoad = 16000; // Safe ceiling to fetch up to 16,000 items
+        const maxItemsToLoad = 20000; // Safe ceiling to fetch up to 20,000 items
+        const seenNames = new Set();
         
         logToConsole("Starting batch-loading of ERPNext items...", "info");
         
@@ -541,19 +571,28 @@ export default function Home() {
           const resIt = await erpRequest(`/api/resource/Item?fields=${encodeURIComponent(fieldsItems)}&limit_page_length=${limit}&limit_start=${offset}`, 'GET', null, profile);
           
           if (resIt.data && resIt.data.length > 0) {
-            allItems = [...allItems, ...resIt.data];
-            logToConsole(`Loaded batch ${offset / limit + 1} (${resIt.data.length} items)...`, "info");
-            offset += limit;
-            if (resIt.data.length < limit) {
-              hasMore = false; // reached end of database
+            let newCount = 0;
+            for (const it of resIt.data) {
+              const key = it.name || it.item_code;
+              if (key && !seenNames.has(key)) {
+                seenNames.add(key);
+                allItems.push(it);
+                newCount++;
+              }
+            }
+            setItemsList([...allItems]);
+            logToConsole(`Loaded batch (${resIt.data.length} items, total cached: ${allItems.length})...`, "info");
+            offset += resIt.data.length;
+            if (newCount === 0) {
+              hasMore = false; // No new items returned
             }
           } else {
-            hasMore = false;
+            hasMore = false; // Reached end of database
           }
         }
         
         if (allItems.length > 0) {
-          setItemsList(allItems);
+          setItemsList([...allItems]);
           logToConsole(`✓ Successfully loaded ${allItems.length} items with purchase rates into cache.`, 'success');
         } else {
           throw new Error("No items returned from ERPNext.");
@@ -562,19 +601,29 @@ export default function Home() {
         logToConsole(`Failed to fetch items with purchase rates, falling back to basic fields. Error: ${itemErr.message}`, 'warn');
         try {
           let allItems = [];
-          let limit = 2000;
+          let limit = 500;
           let offset = 0;
           let hasMore = true;
-          const maxItemsToLoad = 16000;
+          const maxItemsToLoad = 20000;
+          const seenNames = new Set();
           
           while (hasMore && allItems.length < maxItemsToLoad) {
             const fieldsItemsBasic = JSON.stringify(["name", "item_name", "item_code"]);
             const resIt = await erpRequest(`/api/resource/Item?fields=${encodeURIComponent(fieldsItemsBasic)}&limit_page_length=${limit}&limit_start=${offset}`, 'GET', null, profile);
             
             if (resIt.data && resIt.data.length > 0) {
-              allItems = [...allItems, ...resIt.data];
-              offset += limit;
-              if (resIt.data.length < limit) {
+              let newCount = 0;
+              for (const it of resIt.data) {
+                const key = it.name || it.item_code;
+                if (key && !seenNames.has(key)) {
+                  seenNames.add(key);
+                  allItems.push(it);
+                  newCount++;
+                }
+              }
+              setItemsList([...allItems]);
+              offset += resIt.data.length;
+              if (newCount === 0) {
                 hasMore = false;
               }
             } else {
@@ -582,7 +631,7 @@ export default function Home() {
             }
           }
           if (allItems.length > 0) {
-            setItemsList(allItems);
+            setItemsList([...allItems]);
             logToConsole(`✓ Loaded ${allItems.length} items (basic fields) into cache.`, 'success');
           }
         } catch (fbErr) {
@@ -1296,6 +1345,9 @@ export default function Home() {
     
     logToConsole("Verification Form populated with extracted values.", 'info');
     setActiveTab('parser');
+    
+    // Perform live ERPNext lookup for any items that didn't match the current local cache
+    lookupItemsDirectlyInERP(consolidatedItems);
   }
 
   // Sync to ERPNext Dispatcher
@@ -1359,7 +1411,7 @@ export default function Home() {
       const itemCode = (line.item_code || line.description || '').trim();
       if (!itemCode || itemCode === 'Default Item') continue;
 
-      const erpItemMatch = itemsList.find(it => (it.item_code || it.name || '').toLowerCase() === itemCode.toLowerCase());
+      const erpItemMatch = findErpItemRecord(itemCode, itemsList);
       if (!erpItemMatch && !missingItems.includes(itemCode)) {
         missingItems.push(itemCode);
       }
@@ -1428,7 +1480,8 @@ export default function Home() {
     try {
       const consolidatedMap = {};
       for (const line of invoiceForm.items) {
-        const itemCode = line.item_code || 'Default Item';
+        const matchedRec = findErpItemRecord(line.item_code || line.description, itemsList);
+        const itemCode = matchedRec ? (matchedRec.item_code || matchedRec.name) : (line.item_code || 'Default Item').trim();
         const rate = parseFloat(line.rate || 0);
         const qty = parseFloat(line.qty || 0);
         const key = `${itemCode}_${rate.toFixed(4)}`;
@@ -1905,21 +1958,126 @@ export default function Home() {
     return Math.max(0, expected);
   }
 
+  function normalizeItemStr(str) {
+    return String(str || '')
+      .toLowerCase()
+      .replace(/[\u2010\u2011\u2012\u2013\u2014\u2015\u2212]/g, '-')
+      .replace(/[\u00a0\u200b\u200c\u200d]/g, ' ')
+      .trim();
+  }
+
+  function findErpItemRecord(codeOrName, list = itemsList) {
+    const target = normalizeItemStr(codeOrName);
+    if (!target || !list || list.length === 0) return null;
+    return (
+      list.find(it => normalizeItemStr(it.item_code || it.name || '') === target) ||
+      list.find(it => normalizeItemStr(it.item_name || '') === target) ||
+      null
+    );
+  }
+
+  // Live targeted ERPNext lookup for invoice items not yet found in the local cache
+  async function lookupItemsDirectlyInERP(itemsToCheck) {
+    if (!activeProfile || !itemsToCheck || itemsToCheck.length === 0) return;
+
+    const searchTerms = new Set();
+    for (const line of itemsToCheck) {
+      const isDiscount = parseFloat(line.rate || 0) < 0 || (line.description || '').toLowerCase().includes('discount');
+      if (isDiscount) continue;
+
+      const currentMatch = findErpItemRecord(line.item_code || line.description, itemsList);
+      if (currentMatch && line.match_confidence === 'high') continue;
+
+      const rawCandidates = [line.item_code, line.description].filter(Boolean);
+      for (const raw of rawCandidates) {
+        const cleaned = String(raw).trim();
+        if (cleaned && cleaned !== 'Default Item' && cleaned !== 'Line Item' && cleaned.length >= 3) {
+          searchTerms.add(cleaned);
+          // Also add stripped version without parenthetical suffixes like (O-STD)
+          const stripped = cleaned.replace(/\s*\([^)]*\)\s*/g, '').trim();
+          if (stripped && stripped.length >= 3 && stripped !== cleaned) {
+            searchTerms.add(stripped);
+          }
+        }
+      }
+    }
+
+    if (searchTerms.size === 0) return;
+
+    const newlyFoundItems = [];
+    for (const term of searchTerms) {
+      try {
+        const orFilters = JSON.stringify([
+          ["name", "like", `%${term}%`],
+          ["item_code", "like", `%${term}%`],
+          ["item_name", "like", `%${term}%`]
+        ]);
+        const fields = JSON.stringify(["name", "item_name", "item_code", "last_purchase_rate"]);
+        const res = await erpRequest(
+          `/api/resource/Item?or_filters=${encodeURIComponent(orFilters)}&fields=${encodeURIComponent(fields)}&limit_page_length=20`,
+          'GET'
+        );
+        if (res && Array.isArray(res.data) && res.data.length > 0) {
+          newlyFoundItems.push(...res.data);
+        }
+      } catch (err) {
+        // Ignore single-term lookup error and continue
+      }
+    }
+
+    if (newlyFoundItems.length > 0) {
+      setItemsList(prev => {
+        const map = new Map();
+        prev.forEach(it => map.set(it.name || it.item_code, it));
+        newlyFoundItems.forEach(it => {
+          const k = it.name || it.item_code;
+          if (k && !map.has(k)) map.set(k, it);
+        });
+        const merged = Array.from(map.values());
+
+        // Re-evaluate invoiceForm items immediately against merged list
+        setInvoiceForm(currForm => {
+          if (!currForm.items || currForm.items.length === 0) return currForm;
+          let changed = false;
+          const updated = currForm.items.map(line => {
+            const isDiscount = parseFloat(line.rate || 0) < 0 || (line.description || '').toLowerCase().includes('discount');
+            if (isDiscount) return line;
+            const exactExisting = findErpItemRecord(line.item_code, merged);
+            if (exactExisting) {
+              const canonicalCode = exactExisting.item_code || exactExisting.name;
+              if (line.item_code !== canonicalCode || line.match_confidence !== 'high') {
+                changed = true;
+                return { ...line, item_code: canonicalCode, match_confidence: 'high' };
+              }
+              return line;
+            }
+            const matchRes = findMatchingItemCode(line.description || line.item_code, merged);
+            if (matchRes.match_confidence !== 'none' && (matchRes.item_code !== line.item_code || matchRes.match_confidence !== line.match_confidence)) {
+              changed = true;
+              return { ...line, item_code: matchRes.item_code, match_confidence: matchRes.match_confidence };
+            }
+            return line;
+          });
+          return changed ? { ...currForm, items: updated } : currForm;
+        });
+
+        return merged;
+      });
+    }
+  }
+
   // Item Autocomplete matching algorithm
-  function findMatchingItemCode(desc) {
+  function findMatchingItemCode(desc, customList = null) {
+    const listToSearch = customList || itemsList;
     const defaultFallback = desc ? desc.trim() : (parserSettings.defaultItem || '');
-    if (!desc || itemsList.length === 0) return { item_code: defaultFallback, match_confidence: 'none' };
+    if (!desc || !listToSearch || listToSearch.length === 0) return { item_code: defaultFallback, match_confidence: 'none' };
     
     // Sanitize query: standardize dashes, zero-width spaces, trim spaces and leading/trailing punctuation
-    const query = desc
-      .toLowerCase()
-      .replace(/[\u2010\u2011\u2012\u2013\u2014\u2015\u2212]/g, '-') // standardizes dashes
-      .replace(/[\u00a0\u200b\u200c\u200d]/g, ' ')                  // standardizes zero-width spaces
-      .trim()
-      .replace(/^[\s.,:;'"!?,]+|[\s.,:;'"!?,]+$/g, '');             // trims trailing punctuation
+    const query = normalizeItemStr(desc).replace(/^[\s.,:;'"!?,]+|[\s.,:;'"!?,]+$/g, '');
+    const baseQuery = query.replace(/\s*\([^)]*\)\s*/g, '').trim();
     
     if (!query) {
-      const fb = itemsList[0]?.item_code || itemsList[0]?.name || defaultFallback;
+      const fb = listToSearch[0]?.item_code || listToSearch[0]?.name || defaultFallback;
       return { item_code: fb, match_confidence: 'none' };
     }
     
@@ -1954,25 +2112,25 @@ export default function Home() {
     }
 
     function getItemCode(i) {
-      return (i.item_code || i.name || '').toLowerCase().trim();
+      return normalizeItemStr(i.item_code || i.name || '');
     }
 
     function getItemName(i) {
-      return (i.item_name || '').toLowerCase().trim();
+      return normalizeItemStr(i.item_name || '');
     }
 
     // 1. Exact match on code (highest priority)
-    const exactCode = itemsList.find(i => getItemCode(i) === query);
+    const exactCode = listToSearch.find(i => getItemCode(i) === query || (baseQuery.length >= 3 && getItemCode(i) === baseQuery));
     if (exactCode) return { item_code: exactCode.item_code || exactCode.name, match_confidence: 'high' };
     
     // 2. Exact match on name (secondary priority)
-    const exactName = itemsList.find(i => getItemName(i) === query);
+    const exactName = listToSearch.find(i => getItemName(i) === query || (baseQuery.length >= 3 && getItemName(i) === baseQuery));
     if (exactName) return { item_code: exactName.item_code || exactName.name, match_confidence: 'high' };
     
     // 3. Score all candidates
     const candidates = [];
     
-    itemsList.forEach(i => {
+    listToSearch.forEach(i => {
       const code = getItemCode(i);
       const name = getItemName(i);
       
@@ -1982,10 +2140,13 @@ export default function Home() {
       else if (code.includes(query)) codeSubScore = query.length;
       
       let codeTokenMatches = 0;
-      const codeTokens = code.split(/[\s,._/#-]+/).filter(t => t.length >= 2);
+      const codeTokens = code.split(/[\s,._/#()[\]-]+/).filter(t => t.length >= 2);
       codeTokens.forEach(token => { if (query.includes(token)) codeTokenMatches++; });
       const codeTokenRatio = codeTokens.length > 0 ? (codeTokenMatches / codeTokens.length) : 0;
-      const codeLev = getLevenshteinSimilarity(query, code);
+      const codeLev = Math.max(
+        getLevenshteinSimilarity(query, code),
+        baseQuery.length >= 3 ? getLevenshteinSimilarity(baseQuery, code) : 0
+      );
       const codeScore = codeSubScore + (codeTokenRatio * 15.0) + (codeLev * 15.0);
       
       // -- Name matching metrics
@@ -1994,10 +2155,13 @@ export default function Home() {
       else if (name.includes(query)) nameSubScore = query.length;
       
       let nameTokenMatches = 0;
-      const nameTokens = name.split(/[\s,._/#-]+/).filter(t => t.length >= 2);
+      const nameTokens = name.split(/[\s,._/#()[\]-]+/).filter(t => t.length >= 2);
       nameTokens.forEach(token => { if (query.includes(token)) nameTokenMatches++; });
       const nameTokenRatio = nameTokens.length > 0 ? (nameTokenMatches / nameTokens.length) : 0;
-      const nameLev = getLevenshteinSimilarity(query, name);
+      const nameLev = Math.max(
+        getLevenshteinSimilarity(query, name),
+        baseQuery.length >= 3 ? getLevenshteinSimilarity(baseQuery, name) : 0
+      );
       const nameScore = nameSubScore + (nameTokenRatio * 10.0) + (nameLev * 10.0);
       
       candidates.push({ item: i, codeScore, nameScore });
@@ -3516,6 +3680,11 @@ export default function Home() {
                                       newItems[index].match_confidence = matchResult.match_confidence;
                                       setInvoiceForm({ ...invoiceForm, items: newItems });
                                     }}
+                                    onBlur={() => {
+                                      if (invoiceForm.items[index]) {
+                                        lookupItemsDirectlyInERP([invoiceForm.items[index]]);
+                                      }
+                                    }}
                                     style={{ padding: '4px 8px', fontSize: '12px', flex: 1, minWidth: '110px' }}
                                     placeholder="Description on invoice..."
                                   />
@@ -3531,6 +3700,11 @@ export default function Home() {
                                       newItems[index].match_confidence = 'high'; // Assume manual selection is high confidence
                                       setInvoiceForm({ ...invoiceForm, items: newItems });
                                     }}
+                                    onBlur={() => {
+                                      if (invoiceForm.items[index]) {
+                                        lookupItemsDirectlyInERP([invoiceForm.items[index]]);
+                                      }
+                                    }}
                                     style={{ padding: '4px 8px', fontSize: '12px', flex: 1, minWidth: '110px', border: '1px solid rgba(56, 189, 248, 0.3)' }}
                                     placeholder="Type or select item code..."
                                     list="erp-items-datalist"
@@ -3540,7 +3714,7 @@ export default function Home() {
                                   const isDiscount = parseFloat(item.rate || 0) < 0 || (item.description || '').toLowerCase().includes('discount');
                                   if (isDiscount) return null;
                                   
-                                  const erpItemMatch = itemsList.find(it => (it.item_code || it.name || '').toLowerCase() === (item.item_code || '').toLowerCase());
+                                  const erpItemMatch = findErpItemRecord(item.item_code, itemsList);
                                   
                                   if (!erpItemMatch && item.item_code && item.item_code !== 'Default Item') {
                                     return (
