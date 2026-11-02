@@ -1424,43 +1424,35 @@ export default function Home() {
         let createdAny = false;
         
         for (const missingCode of missingItems) {
-          try {
-            const newItemPayload = {
-              item_code: missingCode,
-              item_name: missingCode,
-              item_group: "Product", // User requested 'Product'
-              stock_uom: "Nos",
-              is_stock_item: 1
-            };
-            
-            // Try to create the item
-            const createRes = await erpRequest('/api/resource/Item', 'POST', newItemPayload);
-            if (createRes && createRes.data) {
-              logToConsole(`✓ Successfully created item: ${missingCode}`, 'success');
-              // Append to local state cache immediately so it passes mapping later
-              setItemsList(prev => [...prev, createRes.data]);
-              createdAny = true;
+          const candidateGroups = ["Product", "product", "Products", "All Item Groups"];
+          let itemCreated = false;
+          let lastItemErr = null;
+
+          for (const groupName of candidateGroups) {
+            try {
+              const newItemPayload = {
+                item_code: missingCode,
+                item_name: missingCode,
+                item_group: groupName,
+                stock_uom: "Nos",
+                is_stock_item: 1
+              };
+              const createRes = await erpRequest('/api/resource/Item', 'POST', newItemPayload);
+              if (createRes && createRes.data) {
+                logToConsole(`✓ Successfully created item "${missingCode}" (Item Group: ${groupName})`, 'success');
+                setItemsList(prev => [...prev, createRes.data]);
+                createdAny = true;
+                itemCreated = true;
+                break;
+              }
+            } catch (createErr) {
+              lastItemErr = createErr;
             }
-          } catch (createErr) {
-            // Fallback for strict Item Group naming in standard ERPNext
-            if (createErr.message.includes('Item Group')) {
-               logToConsole(`Retrying ${missingCode} with item_group="Products"...`, 'warn');
-               try {
-                 const fallbackPayload = { item_code: missingCode, item_name: missingCode, item_group: "Products", stock_uom: "Nos", is_stock_item: 1 };
-                 const fbRes = await erpRequest('/api/resource/Item', 'POST', fallbackPayload);
-                 if (fbRes && fbRes.data) {
-                   logToConsole(`✓ Successfully created item: ${missingCode}`, 'success');
-                   setItemsList(prev => [...prev, fbRes.data]);
-                   createdAny = true;
-                 }
-               } catch (fbErr) {
-                 alert(`Failed to create item ${missingCode}. Check Item Group or mandatory fields in ERPNext.`);
-                 return;
-               }
-            } else {
-              alert(`Failed to create item ${missingCode}: ${createErr.message}`);
-              return;
-            }
+          }
+
+          if (!itemCreated) {
+            alert(`Failed to create item ${missingCode}: ${lastItemErr ? lastItemErr.message : 'Unknown error'}`);
+            return;
           }
         }
         if (createdAny) {
@@ -1481,7 +1473,7 @@ export default function Home() {
       const consolidatedMap = {};
       for (const line of invoiceForm.items) {
         const matchedRec = findErpItemRecord(line.item_code || line.description, itemsList);
-        const itemCode = matchedRec ? (matchedRec.item_code || matchedRec.name) : (line.item_code || 'Default Item').trim();
+        const itemCode = matchedRec ? (matchedRec.item_code || matchedRec.name) : (line.item_code || line.description || 'Default Item').trim();
         const rate = parseFloat(line.rate || 0);
         const qty = parseFloat(line.qty || 0);
         const key = `${itemCode}_${rate.toFixed(4)}`;
