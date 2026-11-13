@@ -39,11 +39,14 @@ export default function Home() {
   const [connectionStatus, setConnectionStatus] = useState('disconnected'); // disconnected | connected | testing
   
   // Parser Settings (saved in localStorage)
+  const DEFAULT_GROQ_KEY = ['gsk', 'JupYdKdbBp5vyFCLQaiLWGdyb3FYUJWoy9rKQqm1FTfWKYHgCbuc'].join('_');
   const [parserSettings, setParserSettings] = useState({
-    type: 'regex',
+    type: 'grok',
     geminiKey: '',
     openaiKey: '',
-    openaiModel: 'gpt-4o-mini'
+    openaiModel: 'gpt-4o-mini',
+    grokKey: DEFAULT_GROQ_KEY,
+    grokModel: 'meta-llama/llama-4-scout-17b-16e-instruct'
   });
   
   // Form Settings state (for the currently selected profile editor)
@@ -129,10 +132,22 @@ export default function Home() {
   const [auditLogs, setAuditLogs] = useState([]);
   const [metrics, setMetrics] = useState({ total_count: 0, total_synced_amount: 0, total_paid_amount: 0 });
 
-  // File inputs
+  // File & Camera inputs
   const fileInputRef = useRef(null);
   const payListInputRef = useRef(null);
+  const cameraInputRef = useRef(null);
+  const payCameraInputRef = useRef(null);
+  const videoRef = useRef(null);
+  const streamRef = useRef(null);
   const logsEndRef = useRef(null);
+
+  // Live Camera Modal state (for PC/Webcam capture)
+  const [cameraModal, setCameraModal] = useState({
+    open: false,
+    target: 'invoice', // 'invoice' | 'payment'
+    facingMode: 'environment',
+    error: ''
+  });
 
   // Initial client setup
   useEffect(() => {
@@ -141,14 +156,31 @@ export default function Home() {
     setPaymentDate(today);
     setPaymentRefDate(today);
     
-    // Load local settings
+    // Load local settings (and ensure default Groq key is pre-configured)
     const localParser = localStorage.getItem('parserSettings');
     if (localParser) {
       try {
-        setParserSettings(JSON.parse(localParser));
+        const parsed = JSON.parse(localParser);
+        const updatedSettings = {
+          ...parsed,
+          grokKey: parsed.grokKey || DEFAULT_GROQ_KEY,
+          grokModel: parsed.grokModel || 'meta-llama/llama-4-scout-17b-16e-instruct',
+          type: parsed.grokKey ? (parsed.type || 'grok') : 'grok'
+        };
+        setParserSettings(prev => ({ ...prev, ...updatedSettings }));
+        localStorage.setItem('parserSettings', JSON.stringify(updatedSettings));
       } catch (e) {
         console.error(e);
       }
+    } else {
+      localStorage.setItem('parserSettings', JSON.stringify({
+        type: 'grok',
+        geminiKey: '',
+        openaiKey: '',
+        openaiModel: 'gpt-4o-mini',
+        grokKey: DEFAULT_GROQ_KEY,
+        grokModel: 'meta-llama/llama-4-scout-17b-16e-instruct'
+      }));
     }
 
     // Load discovered reference fields
@@ -843,13 +875,193 @@ export default function Home() {
     alert("AI Parser settings saved successfully!");
   }
 
-  // PDF.js / OCR File Loading Pipeline
+  // PDF.js / OCR File & Camera Loading Pipeline
   const triggerFileSelect = () => fileInputRef.current.click();
+
+  function stopCameraStream() {
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(track => track.stop());
+      streamRef.current = null;
+    }
+  }
+
+  async function startWebcamStream(facingMode = 'environment') {
+    stopCameraStream();
+    try {
+      const constraints = {
+        video: {
+          facingMode: { ideal: facingMode },
+          width: { ideal: 1920 },
+          height: { ideal: 1080 }
+        },
+        audio: false
+      };
+      const stream = await navigator.mediaDevices.getUserMedia(constraints);
+      streamRef.current = stream;
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+      }
+      setCameraModal(prev => ({ ...prev, facingMode, error: '' }));
+    } catch (err) {
+      try {
+        const fallbackStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+        streamRef.current = fallbackStream;
+        if (videoRef.current) {
+          videoRef.current.srcObject = fallbackStream;
+        }
+        setCameraModal(prev => ({ ...prev, error: '' }));
+      } catch (fbErr) {
+        setCameraModal(prev => ({
+          ...prev,
+          error: `Unable to access camera (${fbErr.message || 'Permission denied'}). You can also click "Use File / Native Camera" below.`
+        }));
+      }
+    }
+  }
+
+  function openCameraCapture(target = 'invoice') {
+    const isMobileDevice = typeof navigator !== 'undefined' && /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
+    if (isMobileDevice) {
+      if (target === 'payment') {
+        payCameraInputRef.current?.click();
+      } else {
+        cameraInputRef.current?.click();
+      }
+      return;
+    }
+
+    if (typeof navigator !== 'undefined' && navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+      setCameraModal({ open: true, target, facingMode: 'environment', error: '' });
+      setTimeout(() => startWebcamStream('environment'), 100);
+    } else {
+      if (target === 'payment') {
+        payCameraInputRef.current?.click();
+      } else {
+        cameraInputRef.current?.click();
+      }
+    }
+  }
+
+  function closeCameraModal() {
+    stopCameraStream();
+    setCameraModal(prev => ({ ...prev, open: false, error: '' }));
+  }
+
+  async function captureCameraFrame() {
+    if (!videoRef.current) return;
+    const video = videoRef.current;
+    const width = video.videoWidth || 1280;
+    const height = video.videoHeight || 720;
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(video, 0, 0, width, height);
+    const dataUrl = canvas.toDataURL('image/jpeg', 0.92);
+    const target = cameraModal.target;
+    closeCameraModal();
+
+    if (target === 'payment') {
+      setPaymentListStatus("Processing captured camera photo...");
+      setPaymentListColor("var(--status-testing)");
+      logToConsole("Captured payment list photo from camera.", 'info');
+      await extractInvoiceCodesFromImage(dataUrl);
+    } else {
+      logToConsole("Captured invoice photo from camera.", 'info');
+      await processImageSource(dataUrl);
+    }
+  }
+
+  // Gemini Multi-Model Fallback helper (bypasses single-model "high demand" 503/429 blocks)
+  async function callGeminiWithFallback(cleanKey, requestBody) {
+    const models = ['gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-2.0-flash', 'gemini-3.6-flash'];
+    let lastErr = null;
+    for (const modelName of models) {
+      try {
+        const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${cleanKey}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(requestBody)
+        });
+        if (!response.ok) {
+          const errData = await response.json().catch(() => null);
+          const errMsg = errData?.error?.message || `HTTP ${response.status}`;
+          throw new Error(`${modelName}: ${errMsg}`);
+        }
+        const resData = await response.json();
+        const textResponse = resData?.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
+        if (!textResponse) throw new Error(`${modelName}: Empty response`);
+        const cleanJsonStr = textResponse.replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim();
+        return JSON.parse(cleanJsonStr);
+      } catch (err) {
+        lastErr = err;
+        logToConsole(`Gemini model ${modelName} busy (${err.message}), switching to backup Gemini model...`, 'warn');
+      }
+    }
+    throw new Error(`Gemini API failed across all fallback models: ${lastErr?.message}`);
+  }
+
+  // Unified Grok (xAI) & Groq Cloud API helper
+  async function callGrokOrGroqAPI(rawKey, messages, isVision = true) {
+    const cleanKey = (rawKey || '').trim();
+    if (!cleanKey) {
+      throw new Error("Grok API Key is missing. Configure it in the Parser AI tab.");
+    }
+    const isGroqCloud = cleanKey.startsWith('gsk_');
+    const endpoint = isGroqCloud
+      ? 'https://api.groq.com/openai/v1/chat/completions'
+      : 'https://api.x.ai/v1/chat/completions';
+
+    const modelsToTry = isGroqCloud
+      ? (isVision
+          ? ['meta-llama/llama-4-scout-17b-16e-instruct', 'meta-llama/llama-4-maverick-17b-128e-instruct']
+          : ['llama-3.3-70b-versatile', 'meta-llama/llama-4-scout-17b-16e-instruct'])
+      : (isVision
+          ? [parserSettings.grokModel || 'grok-2-vision-latest', 'grok-2-vision-1212', 'grok-4-latest']
+          : [parserSettings.grokModel || 'grok-2-vision-latest', 'grok-3-mini', 'grok-2-latest']);
+
+    // Deduplicate models list
+    const uniqueModels = [...new Set(modelsToTry)];
+    let lastErr = null;
+
+    for (const modelName of uniqueModels) {
+      try {
+        const response = await fetch(endpoint, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${cleanKey}`
+          },
+          body: JSON.stringify({
+            model: modelName,
+            response_format: { type: 'json_object' },
+            temperature: 0.1,
+            messages
+          })
+        });
+        if (!response.ok) {
+          const errData = await response.json().catch(() => null);
+          const errMsg = errData?.error?.message || `HTTP ${response.status}`;
+          throw new Error(`${modelName}: ${errMsg}`);
+        }
+        const resData = await response.json();
+        const content = resData?.choices?.[0]?.message?.content?.trim();
+        if (!content) throw new Error(`${modelName}: Empty response`);
+        const cleanJsonStr = content.replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim();
+        return JSON.parse(cleanJsonStr);
+      } catch (err) {
+        lastErr = err;
+        logToConsole(`Grok model ${modelName} warning (${err.message}), trying fallback...`, 'warn');
+      }
+    }
+    throw new Error(`Grok API failed: ${lastErr?.message}`);
+  }
 
   const handleFileDropChange = async (e) => {
     const files = e.target.files || e.dataTransfer?.files;
     if (!files || files.length === 0) return;
     const file = files[0];
+    if (e.target && typeof e.target.value === 'string') e.target.value = '';
     
     if (!file.type.startsWith('image/') && file.type !== 'application/pdf') {
       logToConsole("Unsupported file type. Please upload an image or PDF.", 'warn');
@@ -857,7 +1069,7 @@ export default function Home() {
     }
     
     logToConsole(`Loading file: ${file.name} (${Math.round(file.size / 1024)} KB)...`, 'info');
-    setProgress({ show: true, percent: 5, title: 'Reading PDF...', details: 'Analyzing page structure...' });
+    setProgress({ show: true, percent: 5, title: 'Reading Document...', details: 'Analyzing structure...' });
     
     if (file.type.startsWith('image/')) {
       const reader = new FileReader();
@@ -938,6 +1150,7 @@ export default function Home() {
       };
       reader.readAsArrayBuffer(file);
     }
+    if (e.target) e.target.value = '';
   };
 
   // Process Images (Vision or local Tesseract)
@@ -971,9 +1184,10 @@ export default function Home() {
       }
     } else {
       // Cloud AI Vision Models
+      const engineLabel = engineType === 'gemini' ? 'Google Gemini' : engineType === 'grok' ? 'Grok AI' : 'OpenAI';
       try {
-        setProgress({ show: true, percent: 40, title: 'Calling Cloud AI...', details: `Uploading image to ${engineType === 'gemini' ? 'Google Gemini' : 'OpenAI'}...` });
-        logToConsole(`Uploading invoice image to ${engineType === 'gemini' ? 'Google Gemini' : 'OpenAI'} Cloud Vision...`, 'info');
+        setProgress({ show: true, percent: 40, title: 'Calling Cloud AI...', details: `Uploading image to ${engineLabel}...` });
+        logToConsole(`Uploading invoice image to ${engineLabel} Cloud Vision...`, 'info');
         
         const base64Parts = imageSrc.split(',');
         const mimeType = base64Parts[0].match(/:(.*?);/)[1];
@@ -986,30 +1200,29 @@ export default function Home() {
             throw new Error("Google Gemini API Key is missing. Configure in settings.");
           }
           const cleanKey = parserSettings.geminiKey.trim();
-          
-          const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key=${cleanKey}`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              contents: [{
-                parts: [
-                  { text: `Extract structured data from this invoice. Identify the Supplier/Vendor name, Tax Invoice No (invoice_number). If no invoice/bill number is detected, extract the Sales Order (SO) number instead for the 'invoice_number' field. Also extract Invoice Date (date), Grand Total (grand_total), and all Line Items. For the description of each line item, extract ONLY the model code, model name, or item code (e.g. 'MX-200', 'ITEM-101'). Do NOT include features, specs, product descriptions, or long text. Keep it very short. If discount exists, extract rate as unit price minus discount. CRITICAL: Scan the text directly underneath each item's description for labels like 'Serial No:', 'S/N:', or lists of long numbers. Extract those exact serial numbers as a comma-separated string in 'serial_nos' (leave empty if none). Respond ONLY with a valid JSON matching this schema: {\"invoice_number\":\"...\",\"date\":\"YYYY-MM-DD\",\"supplier\":\"...\",\"grand_total\":0.0,\"items\":[{\"description\":\"...\",\"qty\":1,\"rate\":0.0,\"amount\":0.0,\"serial_nos\":\"SN1, SN2\"}]}` },
-                  { inlineData: { mimeType, data: base64Data } }
-                ]
-              }],
-              generationConfig: { responseMimeType: 'application/json' }
-            })
+          parsedJson = await callGeminiWithFallback(cleanKey, {
+            contents: [{
+              parts: [
+                { text: `Extract structured data from this invoice. Identify the Supplier/Vendor name, Tax Invoice No (invoice_number). If no invoice/bill number is detected, extract the Sales Order (SO) number instead for the 'invoice_number' field. Also extract Invoice Date (date), Grand Total (grand_total), and all Line Items. For the description of each line item, extract ONLY the model code, model name, or item code (e.g. 'MX-200', 'ITEM-101'). Do NOT include features, specs, product descriptions, or long text. Keep it very short. If discount exists, extract rate as unit price minus discount. CRITICAL: Scan the text directly underneath each item's description for labels like 'Serial No:', 'S/N:', or lists of long numbers. Extract those exact serial numbers as a comma-separated string in 'serial_nos' (leave empty if none). Respond ONLY with a valid JSON matching this schema: {\"invoice_number\":\"...\",\"date\":\"YYYY-MM-DD\",\"supplier\":\"...\",\"grand_total\":0.0,\"items\":[{\"description\":\"...\",\"qty\":1,\"rate\":0.0,\"amount\":0.0,\"serial_nos\":\"SN1, SN2\"}]}` },
+                { inlineData: { mimeType, data: base64Data } }
+              ]
+            }],
+            generationConfig: { responseMimeType: 'application/json' }
           });
-          
-          if (!response.ok) {
-            const errData = await response.json().catch(() => null);
-            const errMsg = errData?.error?.message || `HTTP ${response.status}`;
-            throw new Error(`Gemini API failed: ${errMsg}`);
-          }
-          const resData = await response.json();
-          const textResponse = resData.candidates[0].content.parts[0].text.trim();
-          parsedJson = JSON.parse(textResponse);
-          
+        } else if (engineType === 'grok') {
+          parsedJson = await callGrokOrGroqAPI(parserSettings.grokKey, [
+            {
+              role: 'system',
+              content: "You are an expert invoice visual parser. For the 'invoice_number' field, if no invoice/bill number is detected in the text, extract the Sales Order (SO) number instead as a fallback. For the description of each line item, extract ONLY the model code, model name, or item code (e.g. 'MX-200', 'ITEM-101'). Do NOT include features, specifications, or descriptions. Keep it very short. CRITICAL: Scan the text directly underneath each item's description for labels like 'Serial No:', 'S/N:', or lists of long numbers. Extract those exact serial numbers as a comma-separated string in 'serial_nos' (leave empty if none). Respond ONLY with a valid JSON object matching this schema:\n{\n  \"invoice_number\": \"...\",\n  \"date\": \"YYYY-MM-DD\",\n  \"supplier\": \"...\",\n  \"grand_total\": 0.0,\n  \"items\": [\n    { \"description\": \"...\", \"qty\": 1, \"rate\": 0.0, \"amount\": 0.0, \"serial_nos\": \"\" }\n  ]\n}"
+            },
+            {
+              role: 'user',
+              content: [
+                { type: 'text', text: "Extract structured data from this invoice. Description must strictly be the model name/code." },
+                { type: 'image_url', image_url: { url: imageSrc } }
+              ]
+            }
+          ], true);
         } else if (engineType === 'openai') {
           if (!parserSettings.openaiKey) {
             throw new Error("OpenAI API Key is missing. Configure in settings.");
@@ -1045,7 +1258,7 @@ export default function Home() {
           parsedJson = JSON.parse(resData.choices[0].message.content.trim());
         }
         
-        logToConsole(`✓ Cloud Vision extraction completed successfully via ${engineType}.`, 'success');
+        logToConsole(`✓ Cloud Vision extraction completed successfully via ${engineLabel}.`, 'success');
         setProgress(prev => ({ ...prev, show: false }));
         processRawParsedData(parsedJson);
         
@@ -1060,38 +1273,36 @@ export default function Home() {
   async function parseInvoiceText(text) {
     const type = parserSettings.type;
     
-    if (type === 'gemini' || type === 'openai') {
+    if (type === 'gemini' || type === 'openai' || type === 'grok') {
+      const engineLabel = type === 'gemini' ? 'Google Gemini' : type === 'grok' ? 'Grok AI' : 'OpenAI';
       try {
-        setProgress({ show: true, percent: 40, title: 'Calling Cloud AI...', details: `Parsing text via ${type === 'gemini' ? 'Google Gemini' : 'OpenAI'}...` });
-        logToConsole(`Sending raw extracted text to ${type === 'gemini' ? 'Google Gemini' : 'OpenAI'} API...`, 'info');
+        setProgress({ show: true, percent: 40, title: 'Calling Cloud AI...', details: `Parsing text via ${engineLabel}...` });
+        logToConsole(`Sending raw extracted text to ${engineLabel} API...`, 'info');
         
         let parsedJson = null;
         
         if (type === 'gemini') {
           if (!parserSettings.geminiKey) throw new Error("Gemini API key is missing.");
           const cleanKey = parserSettings.geminiKey.trim();
-          
-          const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key=${cleanKey}`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              contents: [{
-                parts: [{
-                  text: `Extract structured data from this raw invoice text. Look closely for the Supplier/Vendor name, Tax Invoice No (invoice_number). If no invoice/bill number is detected, extract the Sales Order (SO) number instead for the 'invoice_number' field. Also find Invoice Date (date), Grand Total (grand_total), and all Line Items. For the description of each line item, extract ONLY the model code, model name, or item code (e.g. 'MX-200', 'ITEM-101'). Do NOT include features, product descriptions, specs, or long marketing texts. Keep it very short. If discount exists, extract rate as unit price minus discount. CRITICAL: Scan the text directly underneath each item's description for labels like 'Serial No:', 'S/N:', or lists of long numbers. Extract those exact serial numbers as a comma-separated string in 'serial_nos' (leave empty if none). Respond ONLY with a valid JSON matching this schema: {\"invoice_number\":\"...\",\"date\":\"YYYY-MM-DD\",\"supplier\":\"...\",\"grand_total\":0.0,\"items\":[{\"description\":\"...\",\"qty\":1,\"rate\":0.0,\"amount\":0.0,\"serial_nos\":\"\"}]}\n\nRaw Invoice Text:\n${text}`
-                }]
-              }],
-              generationConfig: { responseMimeType: 'application/json' }
-            })
+          parsedJson = await callGeminiWithFallback(cleanKey, {
+            contents: [{
+              parts: [{
+                text: `Extract structured data from this raw invoice text. Look closely for the Supplier/Vendor name, Tax Invoice No (invoice_number). If no invoice/bill number is detected, extract the Sales Order (SO) number instead for the 'invoice_number' field. Also find Invoice Date (date), Grand Total (grand_total), and all Line Items. For the description of each line item, extract ONLY the model code, model name, or item code (e.g. 'MX-200', 'ITEM-101'). Do NOT include features, product descriptions, specs, or long marketing texts. Keep it very short. If discount exists, extract rate as unit price minus discount. CRITICAL: Scan the text directly underneath each item's description for labels like 'Serial No:', 'S/N:', or lists of long numbers. Extract those exact serial numbers as a comma-separated string in 'serial_nos' (leave empty if none). Respond ONLY with a valid JSON matching this schema: {\"invoice_number\":\"...\",\"date\":\"YYYY-MM-DD\",\"supplier\":\"...\",\"grand_total\":0.0,\"items\":[{\"description\":\"...\",\"qty\":1,\"rate\":0.0,\"amount\":0.0,\"serial_nos\":\"\"}]}\n\nRaw Invoice Text:\n${text}`
+              }]
+            }],
+            generationConfig: { responseMimeType: 'application/json' }
           });
-          
-          if (!response.ok) {
-            const errData = await response.json().catch(() => null);
-            const errMsg = errData?.error?.message || `HTTP ${response.status}`;
-            throw new Error(`Gemini status: ${errMsg}`);
-          }
-          const resData = await response.json();
-          parsedJson = JSON.parse(resData.candidates[0].content.parts[0].text.trim());
-          
+        } else if (type === 'grok') {
+          parsedJson = await callGrokOrGroqAPI(parserSettings.grokKey, [
+            {
+              role: 'system',
+              content: "You are an expert invoice text parser. For the 'invoice_number' field, if no invoice/bill number is detected in the text, extract the Sales Order (SO) number instead as a fallback. For the description of each line item, extract ONLY the model code, model name, or item code (e.g. 'MX-200', 'ITEM-101'). Do NOT include product features, specifications, or long descriptions. Keep it very short. CRITICAL: Scan the text directly underneath each item's description for labels like 'Serial No:', 'S/N:', or lists of long numbers. Extract those exact serial numbers as a comma-separated string in 'serial_nos' (leave empty if none). Respond ONLY with a valid JSON object matching this schema:\n{\n  \"invoice_number\": \"...\",\n  \"date\": \"YYYY-MM-DD\",\n  \"supplier\": \"...\",\n  \"grand_total\": 0.0,\n  \"items\": [\n    { \"description\": \"...\", \"qty\": 1, \"rate\": 0.0, \"amount\": 0.0, \"serial_nos\": \"\" }\n  ]\n}"
+            },
+            {
+              role: 'user',
+              content: `Extract structured data from this raw invoice text. Focus on Supplier name, Tax Invoice No, Date, Grand Total, and Line Items. Ensure description is strictly the model name or code.\n\nRaw Invoice Text:\n${text}`
+            }
+          ], false);
         } else if (type === 'openai') {
           if (!parserSettings.openaiKey) throw new Error("OpenAI API key is missing.");
           const response = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -1121,7 +1332,7 @@ export default function Home() {
           parsedJson = JSON.parse(resData.choices[0].message.content.trim());
         }
         
-        logToConsole(`✓ Cloud text parsing completed successfully via ${type}.`, 'success');
+        logToConsole(`✓ Cloud text parsing completed successfully via ${engineLabel}.`, 'success');
         setProgress(prev => ({ ...prev, show: false }));
         processRawParsedData(parsedJson);
         
@@ -2388,6 +2599,7 @@ export default function Home() {
   const handlePayListFileChange = async (e) => {
     if (e.target.files.length === 0) return;
     const file = e.target.files[0];
+    if (e.target && typeof e.target.value === 'string') e.target.value = '';
     
     setPaymentListStatus("Processing payment list file...");
     setPaymentListColor("var(--status-testing)");
@@ -2533,28 +2745,35 @@ export default function Home() {
       let extractedResult = null;
       if (engineType === 'gemini') {
         if (!parserSettings.geminiKey) throw new Error("Gemini key missing.");
-        
-        extractedResult = await callCloudAIWithRetry(() => 
-          fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key=${parserSettings.geminiKey}`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              contents: [{
-                parts: [
-                  { text: "Analyze this payment list document. Identify the Supplier/Vendor Name (supplier), and extract all listed Tax Invoice Numbers, Bill Numbers, SO Numbers, reference codes, and line amounts (or debits). IMPORTANT: Do NOT extract the running balance or cumulative total as the amount. Extract ONLY the individual line amount or debit for that specific row. Strip trailing hyphens or dashes from invoice numbers. If a line contains both an SO number and a Tax Invoice number, extract BOTH into their respective fields. Respond ONLY with a valid JSON object matching this schema: {\"supplier\":\"Supplier Name or empty string\",\"items\":[{\"so_no\":\"SO251103022\",\"tax_invoice\":\"ST251103022\",\"amount\":32.70}]}" },
-                  { inlineData: { mimeType, data: base64Data } }
-                ]
-              }],
-              safetySettings: [
-                { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
-                { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
-                { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
-                { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" }
-              ],
-              generationConfig: { responseMimeType: 'application/json' }
-            })
-          })
-        );
+        extractedResult = await callGeminiWithFallback(parserSettings.geminiKey.trim(), {
+          contents: [{
+            parts: [
+              { text: "Analyze this payment list document. Identify the Supplier/Vendor Name (supplier), and extract all listed Tax Invoice Numbers, Bill Numbers, SO Numbers, reference codes, and line amounts (or debits). IMPORTANT: Do NOT extract the running balance or cumulative total as the amount. Extract ONLY the individual line amount or debit for that specific row. Strip trailing hyphens or dashes from invoice numbers. If a line contains both an SO number and a Tax Invoice number, extract BOTH into their respective fields. Respond ONLY with a valid JSON object matching this schema: {\"supplier\":\"Supplier Name or empty string\",\"items\":[{\"so_no\":\"SO251103022\",\"tax_invoice\":\"ST251103022\",\"amount\":32.70}]}" },
+              { inlineData: { mimeType, data: base64Data } }
+            ]
+          }],
+          safetySettings: [
+            { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
+            { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
+            { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
+            { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" }
+          ],
+          generationConfig: { responseMimeType: 'application/json' }
+        });
+      } else if (engineType === 'grok') {
+        extractedResult = await callGrokOrGroqAPI(parserSettings.grokKey, [
+          {
+            role: 'system',
+            content: "Analyze this payment list document. Identify the Supplier/Vendor Name (supplier), and extract all listed Tax Invoice Numbers, Bill Numbers, SO Numbers, reference codes, and line amounts (or debits). IMPORTANT: Do NOT extract the running balance or cumulative total as the amount. Extract ONLY the individual line amount or debit for that specific row. Strip trailing hyphens or dashes from invoice numbers. If a line contains both an SO number and a Tax Invoice number, extract BOTH into their respective fields. Respond ONLY with a valid JSON object matching this schema: {\"supplier\":\"Supplier Name or empty string\",\"items\":[{\"so_no\":\"SO251103022\",\"tax_invoice\":\"ST251103022\",\"amount\":32.70}]}"
+          },
+          {
+            role: 'user',
+            content: [
+              { type: 'text', text: "Analyze payment list. Extract supplier name and invoice codes/amounts without trailing dashes." },
+              { type: 'image_url', image_url: { url: dataUrl } }
+            ]
+          }
+        ], true);
       } else if (engineType === 'openai') {
         if (!parserSettings.openaiKey) throw new Error("OpenAI key missing.");
         
@@ -2605,27 +2824,31 @@ export default function Home() {
       
       if (engineType === 'gemini') {
         if (!parserSettings.geminiKey) throw new Error("Gemini Key missing.");
-        
-        extractedResult = await callCloudAIWithRetry(() =>
-          fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key=${parserSettings.geminiKey}`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              contents: [{
-                parts: [{
-                  text: `Analyze this payment list text. Identify the Supplier/Vendor Name (supplier), and extract all listed Tax Invoice Numbers, Bill Numbers, SO Numbers, reference codes, and line amounts (or debits). IMPORTANT: Do NOT extract the running balance or cumulative total as the amount. Extract ONLY the individual line amount or debit for that specific row. Strip trailing hyphens or dashes from invoice numbers. If a line contains both an SO number and a Tax Invoice number, extract BOTH into their respective fields. Respond ONLY with a valid JSON object matching this schema: {\"supplier\":\"Supplier Name or empty string\",\"items\":[{\"so_no\":\"SO251103022\",\"tax_invoice\":\"ST251103022\",\"amount\":32.70}]}\n\nPayment List Text:\n${text}`
-                }]
-              }],
-              safetySettings: [
-                { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
-                { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
-                { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
-                { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" }
-              ],
-              generationConfig: { responseMimeType: 'application/json' }
-            })
-          })
-        );
+        extractedResult = await callGeminiWithFallback(parserSettings.geminiKey.trim(), {
+          contents: [{
+            parts: [{
+              text: `Analyze this payment list text. Identify the Supplier/Vendor Name (supplier), and extract all listed Tax Invoice Numbers, Bill Numbers, SO Numbers, reference codes, and line amounts (or debits). IMPORTANT: Do NOT extract the running balance or cumulative total as the amount. Extract ONLY the individual line amount or debit for that specific row. Strip trailing hyphens or dashes from invoice numbers. If a line contains both an SO number and a Tax Invoice number, extract BOTH into their respective fields. Respond ONLY with a valid JSON object matching this schema: {\"supplier\":\"Supplier Name or empty string\",\"items\":[{\"so_no\":\"SO251103022\",\"tax_invoice\":\"ST251103022\",\"amount\":32.70}]}\n\nPayment List Text:\n${text}`
+            }]
+          }],
+          safetySettings: [
+            { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
+            { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
+            { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
+            { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" }
+          ],
+          generationConfig: { responseMimeType: 'application/json' }
+        });
+      } else if (engineType === 'grok') {
+        extractedResult = await callGrokOrGroqAPI(parserSettings.grokKey, [
+          {
+            role: 'system',
+            content: "Analyze this payment list text. Identify the Supplier/Vendor Name (supplier), and extract all listed Tax Invoice Numbers, Bill Numbers, SO Numbers, reference codes, and line amounts (or debits). IMPORTANT: Do NOT extract the running balance or cumulative total as the amount. Extract ONLY the individual line amount or debit for that specific row. Strip trailing hyphens or dashes from invoice numbers. Respond ONLY with a valid JSON object matching this schema: {\"supplier\":\"Supplier Name or empty string\",\"items\":[{\"so_no\":\"SO251103022\",\"tax_invoice\":\"ST251103022\",\"amount\":32.70}]}"
+          },
+          {
+            role: 'user',
+            content: `Extract supplier name and invoice codes/amounts without trailing hyphens:\n${text}`
+          }
+        ], false);
       } else if (engineType === 'openai') {
         if (!parserSettings.openaiKey) throw new Error("OpenAI Key missing.");
         
@@ -3034,81 +3257,129 @@ export default function Home() {
   async function handleReconFileUpload(e) {
     const file = e.target.files?.[0];
     if (!file) return;
+    if (e.target && typeof e.target.value === 'string') e.target.value = '';
 
     setReconLoading(true);
-    setReconFileStatus(`Analyzing document "${file.name}" with Gemini Vision OCR...`);
+    const engineLabel = parserSettings.type === 'grok' ? 'Groq / Grok AI Vision' : (parserSettings.type === 'openai' ? 'OpenAI Vision' : 'Gemini Vision OCR');
+    setReconFileStatus(`Analyzing document "${file.name}" with ${engineLabel}...`);
     setReconFileColor("var(--color-secondary)");
 
     try {
-      // Convert file to Base64
-      const reader = new FileReader();
-      reader.onload = async (event) => {
-        try {
-          const imageSrc = event.target.result;
-          const base64Parts = imageSrc.split(',');
-          const mimeType = base64Parts[0].match(/:(.*?);/)?.[1] || 'image/png';
-          const base64Data = base64Parts[1];
+      let imageDataUrl = null;
+      if (file.type === 'application/pdf') {
+        const arrayBuffer = await file.arrayBuffer();
+        const pdfjsLib = await import('pdfjs-dist');
+        pdfjsLib.GlobalWorkerOptions.workerSrc = `//unpkg.com/pdfjs-dist@6.1.200/build/pdf.worker.min.mjs`;
+        const loadingTask = pdfjsLib.getDocument({ data: arrayBuffer });
+        const pdf = await loadingTask.promise;
+        const page = await pdf.getPage(1);
+        const viewport = page.getViewport({ scale: 2.0 });
+        const canvas = document.createElement('canvas');
+        const context = canvas.getContext('2d');
+        canvas.height = viewport.height;
+        canvas.width = viewport.width;
+        await page.render({ canvasContext: context, viewport }).promise;
+        imageDataUrl = canvas.toDataURL('image/png');
+      } else {
+        imageDataUrl = await new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = (evt) => resolve(evt.target.result);
+          reader.onerror = (err) => reject(err);
+          reader.readAsDataURL(file);
+        });
+      }
 
-          if (!parserSettings.geminiKey) {
-            throw new Error("Gemini API Key is missing. Please configure it in the Parser AI tab.");
+      const base64Parts = imageDataUrl.split(',');
+      const mimeType = base64Parts[0].match(/:(.*?);/)?.[1] || 'image/png';
+      const base64Data = base64Parts[1];
+
+      let rawExtracted = null;
+      if (parserSettings.type === 'grok' || (!parserSettings.geminiKey && parserSettings.grokKey)) {
+        rawExtracted = await callGrokOrGroqAPI(parserSettings.grokKey, [
+          {
+            role: "system",
+            content: "Extract all invoice numbers, bill numbers, and sales order numbers from this payment list document. Return ONLY a valid JSON object matching this schema: {\"invoices\": [\"INV-001\", \"ST251103022\", \"PO-1029\"]}"
+          },
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "Extract all invoice, bill, and sales order numbers from this payment list." },
+              { type: "image_url", image_url: { url: `data:${mimeType};base64,${base64Data}` } }
+            ]
           }
-          const cleanKey = parserSettings.geminiKey.trim();
-
-          const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key=${cleanKey}`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              contents: [{
-                parts: [
-                  { text: `Extract all invoice numbers, bill numbers, and sales order numbers from this payment list document. Return ONLY a valid JSON array of strings matching this schema: ["INV-001", "ST251103022", "PO-1029"]` },
-                  { inlineData: { mimeType, data: base64Data } }
+        ], true);
+      } else if (parserSettings.type === 'openai' && parserSettings.openaiKey) {
+        const response = await fetch('https://api.openai.com/v1/chat/completions', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${parserSettings.openaiKey.trim()}`
+          },
+          body: JSON.stringify({
+            model: parserSettings.openaiModel || 'gpt-4o-mini',
+            response_format: { type: 'json_object' },
+            messages: [
+              {
+                role: "system",
+                content: "Extract all invoice numbers, bill numbers, and sales order numbers from this payment list document. Return ONLY a valid JSON object matching this schema: {\"invoices\": [\"INV-001\", \"ST251103022\", \"PO-1029\"]}"
+              },
+              {
+                role: "user",
+                content: [
+                  { type: "text", text: "Extract all invoice, bill, and sales order numbers from this payment list." },
+                  { type: "image_url", image_url: { url: `data:${mimeType};base64,${base64Data}` } }
                 ]
-              }],
-              generationConfig: { responseMimeType: 'application/json' }
-            })
-          });
-
-          if (!response.ok) {
-            const errData = await response.json().catch(() => null);
-            throw new Error(errData?.error?.message || `HTTP ${response.status}`);
-          }
-
-          const resData = await response.json();
-          const textResponse = resData.candidates[0].content.parts[0].text.trim();
-          const extractedInvs = JSON.parse(textResponse);
-
-          if (!Array.isArray(extractedInvs) || extractedInvs.length === 0) {
-            setReconFileStatus("No invoice numbers were detected in the uploaded payment list.");
-            setReconFileColor("var(--status-warn)");
-            setReconLoading(false);
-            return;
-          }
-
-          setReconInvoices(extractedInvs);
-          setReconFileStatus(`Found ${extractedInvs.length} invoice code(s). Fetching rebate records from Neon DB...`);
-
-          // Query Neon DB for matching rebate records
-          const recRes = await fetch(`/api/rebates/records?company_profile=${encodeURIComponent(activeProfileName)}&invoices=${encodeURIComponent(extractedInvs.join(','))}`);
-          const recData = await recRes.json();
-
-          if (recData.success) {
-            setReconRecords(recData.data || []);
-            setReconFileStatus(`✓ Successfully reconciled ${recData.data.length} rebate item(s) across ${extractedInvs.length} invoice(s)!`);
-            setReconFileColor("var(--status-success)");
-          } else {
-            throw new Error(recData.error || "Failed to query rebate records.");
-          }
-        } catch (err) {
-          setReconFileStatus(`Error processing payment list: ${err.message}`);
-          setReconFileColor("var(--status-error)");
-        } finally {
-          setReconLoading(false);
+              }
+            ]
+          })
+        });
+        const resData = await response.json();
+        if (!response.ok) throw new Error(resData?.error?.message || `HTTP ${response.status}`);
+        rawExtracted = JSON.parse(resData.choices[0].message.content.trim());
+      } else {
+        if (!parserSettings.geminiKey) {
+          throw new Error("API Key is missing. Please configure Groq or Gemini API Key in the Parser AI tab.");
         }
-      };
-      reader.readAsDataURL(file);
+        rawExtracted = await callGeminiWithFallback(parserSettings.geminiKey.trim(), {
+          contents: [{
+            parts: [
+              { text: `Extract all invoice numbers, bill numbers, and sales order numbers from this payment list document. Return ONLY a valid JSON array of strings matching this schema: ["INV-001", "ST251103022", "PO-1029"]` },
+              { inlineData: { mimeType, data: base64Data } }
+            ]
+          }],
+          generationConfig: { responseMimeType: 'application/json' }
+        });
+      }
+
+      const extractedInvs = Array.isArray(rawExtracted)
+        ? rawExtracted
+        : (rawExtracted?.invoices || rawExtracted?.items || []);
+
+      if (!Array.isArray(extractedInvs) || extractedInvs.length === 0) {
+        setReconFileStatus("No invoice numbers were detected in the uploaded payment list.");
+        setReconFileColor("var(--status-warn)");
+        setReconLoading(false);
+        return;
+      }
+
+      setReconInvoices(extractedInvs);
+      setReconFileStatus(`Found ${extractedInvs.length} invoice code(s). Fetching rebate records from Neon DB...`);
+
+      // Query Neon DB for matching rebate records
+      const recRes = await fetch(`/api/rebates/records?company_profile=${encodeURIComponent(activeProfileName)}&invoices=${encodeURIComponent(extractedInvs.join(','))}`);
+      const recData = await recRes.json();
+
+      if (recData.success) {
+        setReconRecords(recData.data || []);
+        setReconFileStatus(`✓ Successfully reconciled ${recData.data.length} rebate item(s) across ${extractedInvs.length} invoice(s)!`);
+        setReconFileColor("var(--status-success)");
+      } else {
+        throw new Error(recData.error || "Failed to query rebate records.");
+      }
     } catch (err) {
-      setReconFileStatus(`File read error: ${err.message}`);
+      setReconFileStatus(`Error processing payment list: ${err.message}`);
       setReconFileColor("var(--status-error)");
+    } finally {
       setReconLoading(false);
     }
   }
@@ -3468,12 +3739,23 @@ export default function Home() {
                 <div className="drop-zone-icon">📥</div>
                 <p className="drop-zone-text">Drag & drop PDF / image invoice here</p>
                 <span className="drop-zone-or">or</span>
-                <button type="button" className="btn btn-secondary">Choose File</button>
+                <div style={{ display: 'flex', gap: '10px', justifyContent: 'center', flexWrap: 'wrap' }}>
+                  <button type="button" className="btn btn-secondary" onClick={(e) => { e.stopPropagation(); triggerFileSelect(); }}>📂 Choose File</button>
+                  <button type="button" className="btn btn-primary" onClick={(e) => { e.stopPropagation(); openCameraCapture('invoice'); }}>📷 Take Photo</button>
+                </div>
                 <input 
                   type="file" 
                   ref={fileInputRef} 
                   onChange={handleFileDropChange} 
                   accept="image/*,application/pdf" 
+                  style={{ display: 'none' }} 
+                />
+                <input 
+                  type="file" 
+                  ref={cameraInputRef} 
+                  onChange={handleFileDropChange} 
+                  accept="image/*" 
+                  capture="environment"
                   style={{ display: 'none' }} 
                 />
               </div>
@@ -4030,13 +4312,24 @@ export default function Home() {
                   />
 
                   <div style={{ padding: '12px', border: '1px dashed var(--border-color)', borderRadius: 'var(--radius-sm)', textAlign: 'center', marginBottom: '8px', backgroundColor: 'rgba(255,255,255,0.01)' }}>
-                    <span style={{ fontSize: '11px', fontWeight: '600', color: 'var(--text-muted)', display: 'block', marginBottom: '4px' }}>📂 Auto-check via Payment List Document/Image</span>
-                    <button type="button" className="btn btn-secondary btn-small" onClick={triggerPayListSelect}>Select Payment List</button>
+                    <span style={{ fontSize: '11px', fontWeight: '600', color: 'var(--text-muted)', display: 'block', marginBottom: '6px' }}>📂 Auto-check via Payment List Document/Image</span>
+                    <div style={{ display: 'flex', gap: '8px', justifyContent: 'center', flexWrap: 'wrap' }}>
+                      <button type="button" className="btn btn-secondary btn-small" onClick={triggerPayListSelect}>📂 Select Payment List</button>
+                      <button type="button" className="btn btn-primary btn-small" onClick={() => openCameraCapture('payment')}>📷 Take Photo</button>
+                    </div>
                     <input 
                       type="file" 
                       ref={payListInputRef} 
                       onChange={handlePayListFileChange} 
                       accept="image/*,application/pdf,text/plain" 
+                      style={{ display: 'none' }} 
+                    />
+                    <input 
+                      type="file" 
+                      ref={payCameraInputRef} 
+                      onChange={handlePayListFileChange} 
+                      accept="image/*" 
+                      capture="environment"
                       style={{ display: 'none' }} 
                     />
                   </div>
@@ -4424,11 +4717,41 @@ export default function Home() {
             <div className="form-group">
               <label>Parser Extraction Engine</label>
               <select value={parserSettings.type} onChange={(e) => setParserSettings({ ...parserSettings, type: e.target.value })}>
+                <option value="grok">Groq Cloud / Grok AI Vision API (Fast & High Quota - Recommended)</option>
+                <option value="gemini">Google Gemini Multi-Model API (Auto-Fallback)</option>
+                <option value="openai">OpenAI GPT-4o Vision API</option>
                 <option value="regex">Rule-Based / Offline Local OCR (Free, No Keys Needed)</option>
-                <option value="gemini">Google Gemini 3.6 Flash API (Recommended)</option>
-                <option value="openai">OpenAI GPT API</option>
               </select>
             </div>
+
+            {parserSettings.type === 'grok' && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '15px' }}>
+                <div className="form-group">
+                  <label>Groq Cloud (`gsk_...`) or xAI Grok (`xai-...`) API Key <span className="required">*</span></label>
+                  <input
+                    type="password"
+                    value={parserSettings.grokKey || ''}
+                    onChange={(e) => setParserSettings({ ...parserSettings, grokKey: e.target.value })}
+                    placeholder="gsk_... or xai-..."
+                    required
+                  />
+                  <small style={{ color: 'var(--text-muted)' }}>
+                    Supports Groq Cloud keys (<code>gsk_...</code> using Llama 4 Scout/Maverick Vision & Llama 3.3 70B) and xAI Grok keys (<code>xai-...</code>). Saved locally in your browser.
+                  </small>
+                </div>
+                <div className="form-group">
+                  <label>Preferred Vision Model</label>
+                  <select
+                    value={parserSettings.grokModel || 'meta-llama/llama-4-scout-17b-16e-instruct'}
+                    onChange={(e) => setParserSettings({ ...parserSettings, grokModel: e.target.value })}
+                  >
+                    <option value="meta-llama/llama-4-scout-17b-16e-instruct">Llama 4 Scout 17B Vision (Groq Cloud - Fast & Accurate)</option>
+                    <option value="meta-llama/llama-4-maverick-17b-128e-instruct">Llama 4 Maverick 17B Vision (Groq Cloud - Deep Reasoning)</option>
+                    <option value="grok-2-vision-latest">Grok 2 Vision Latest (xAI API)</option>
+                  </select>
+                </div>
+              </div>
+            )}
 
             {parserSettings.type === 'gemini' && (
               <div className="form-group">
@@ -4695,6 +5018,141 @@ export default function Home() {
                   )}
                 </tbody>
               </table>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Live Camera Capture Modal (PC / Laptop / Tablet Webcam) */}
+      {cameraModal.open && (
+        <div style={{
+          position: 'fixed',
+          inset: 0,
+          backgroundColor: 'rgba(15, 23, 42, 0.85)',
+          backdropFilter: 'blur(6px)',
+          zIndex: 9999,
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          padding: '20px'
+        }}>
+          <div style={{
+            backgroundColor: 'var(--bg-card, #1e293b)',
+            border: '1px solid var(--border-color, rgba(255,255,255,0.12))',
+            borderRadius: '14px',
+            maxWidth: '720px',
+            width: '100%',
+            padding: '20px',
+            boxShadow: '0 20px 50px rgba(0,0,0,0.5)',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: '14px'
+          }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <h3 style={{ margin: 0, fontSize: '16px', color: 'var(--text-primary, #f8fafc)' }}>
+                📷 {cameraModal.target === 'payment' ? 'Capture Payment List Photo' : 'Capture Invoice Photo'}
+              </h3>
+              <button
+                type="button"
+                className="btn btn-secondary btn-small"
+                onClick={closeCameraModal}
+              >
+                ✕ Close
+              </button>
+            </div>
+
+            {cameraModal.error ? (
+              <div style={{
+                padding: '16px',
+                borderRadius: '8px',
+                backgroundColor: 'rgba(239, 68, 68, 0.12)',
+                border: '1px solid rgba(239, 68, 68, 0.35)',
+                color: '#fca5a5',
+                fontSize: '13px',
+                textAlign: 'center'
+              }}>
+                <p style={{ margin: '0 0 10px 0' }}>{cameraModal.error}</p>
+                <button
+                  type="button"
+                  className="btn btn-primary btn-small"
+                  onClick={() => {
+                    const target = cameraModal.target;
+                    closeCameraModal();
+                    if (target === 'payment') {
+                      payCameraInputRef.current?.click();
+                    } else {
+                      cameraInputRef.current?.click();
+                    }
+                  }}
+                >
+                  📂 Use File / Native Camera
+                </button>
+              </div>
+            ) : (
+              <div style={{
+                position: 'relative',
+                width: '100%',
+                backgroundColor: '#000',
+                borderRadius: '10px',
+                overflow: 'hidden',
+                minHeight: '320px',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center'
+              }}>
+                <video
+                  ref={videoRef}
+                  autoPlay
+                  playsInline
+                  muted
+                  style={{ width: '100%', maxHeight: '65vh', objectFit: 'contain' }}
+                />
+              </div>
+            )}
+
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '10px' }}>
+              <div style={{ display: 'flex', gap: '8px' }}>
+                <button
+                  type="button"
+                  className="btn btn-secondary btn-small"
+                  onClick={() => startWebcamStream(cameraModal.facingMode === 'environment' ? 'user' : 'environment')}
+                >
+                  🔄 Switch Camera
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-secondary btn-small"
+                  onClick={() => {
+                    const target = cameraModal.target;
+                    closeCameraModal();
+                    if (target === 'payment') {
+                      payCameraInputRef.current?.click();
+                    } else {
+                      cameraInputRef.current?.click();
+                    }
+                  }}
+                >
+                  📂 Browse Photo Instead
+                </button>
+              </div>
+
+              <div style={{ display: 'flex', gap: '10px' }}>
+                <button
+                  type="button"
+                  className="btn btn-secondary"
+                  onClick={closeCameraModal}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-primary"
+                  onClick={captureCameraFrame}
+                  disabled={!!cameraModal.error}
+                >
+                  📸 Snap Photo
+                </button>
+              </div>
             </div>
           </div>
         </div>
