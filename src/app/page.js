@@ -46,7 +46,7 @@ export default function Home() {
     openaiKey: '',
     openaiModel: 'gpt-4o-mini',
     grokKey: DEFAULT_GROQ_KEY,
-    grokModel: 'meta-llama/llama-4-scout-17b-16e-instruct'
+    grokModel: 'qwen/qwen3.8-27b'
   });
   
   // Form Settings state (for the currently selected profile editor)
@@ -156,15 +156,16 @@ export default function Home() {
     setPaymentDate(today);
     setPaymentRefDate(today);
     
-    // Load local settings (and ensure default Groq key is pre-configured)
+    // Load local settings (and ensure default Groq key & active 2026 model are pre-configured)
     const localParser = localStorage.getItem('parserSettings');
     if (localParser) {
       try {
         const parsed = JSON.parse(localParser);
+        const isDeprecatedLlama4 = parsed.grokModel && parsed.grokModel.includes('llama-4-');
         const updatedSettings = {
           ...parsed,
           grokKey: parsed.grokKey || DEFAULT_GROQ_KEY,
-          grokModel: parsed.grokModel || 'meta-llama/llama-4-scout-17b-16e-instruct',
+          grokModel: (!parsed.grokModel || isDeprecatedLlama4) ? 'qwen/qwen3.8-27b' : parsed.grokModel,
           type: parsed.grokKey ? (parsed.type || 'grok') : 'grok'
         };
         setParserSettings(prev => ({ ...prev, ...updatedSettings }));
@@ -179,7 +180,7 @@ export default function Home() {
         openaiKey: '',
         openaiModel: 'gpt-4o-mini',
         grokKey: DEFAULT_GROQ_KEY,
-        grokModel: 'meta-llama/llama-4-scout-17b-16e-instruct'
+        grokModel: 'qwen/qwen3.8-27b'
       }));
     }
 
@@ -1001,27 +1002,156 @@ export default function Home() {
     throw new Error(`Gemini API failed across all fallback models: ${lastErr?.message}`);
   }
 
-  // Unified Grok (xAI) & Groq Cloud API helper
+  // Helper: Parse JSON cleanly from AI response (strips <think> reasoning tags & code fences)
+  function parseJsonFromAIContent(rawContent) {
+    if (!rawContent) throw new Error("Empty response content");
+    let cleaned = rawContent
+      .replace(/<think>[\s\S]*?<\/think>/gi, '')
+      .replace(/^```json\s*/i, '')
+      .replace(/^```\s*/i, '')
+      .replace(/```\s*$/i, '')
+      .trim();
+    try {
+      return JSON.parse(cleaned);
+    } catch (e) {
+      const objMatch = cleaned.match(/(\{[\s\S]*\}|\[[\s\S]*\])/);
+      if (objMatch) {
+        return JSON.parse(objMatch[1]);
+      }
+      throw e;
+    }
+  }
+
+  // Helper: Compress/resize base64 dataUrl image so it stays well under Groq's 4MB base64 limit
+  async function compressImageDataUrl(dataUrl, maxDim = 1800, quality = 0.85) {
+    if (typeof window === 'undefined' || !dataUrl || !dataUrl.startsWith('data:image/')) return dataUrl;
+    // Only compress if larger than ~1.5MB or non-jpeg/png
+    if (dataUrl.length < 1500000) return dataUrl;
+    return new Promise((resolve) => {
+      const img = new Image();
+      img.onload = () => {
+        let { width, height } = img;
+        if (width > maxDim || height > maxDim) {
+          if (width > height) {
+            height = Math.round((height * maxDim) / width);
+            width = maxDim;
+          } else {
+            width = Math.round((width * maxDim) / height);
+            height = maxDim;
+          }
+        }
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(img, 0, 0, width, height);
+        resolve(canvas.toDataURL('image/jpeg', quality));
+      };
+      img.onerror = () => resolve(dataUrl);
+      img.src = dataUrl;
+    });
+  }
+
+  // Unified Grok (xAI) & Groq Cloud API helper with live model discovery & hybrid OCR fallback
   async function callGrokOrGroqAPI(rawKey, messages, isVision = true) {
     const cleanKey = (rawKey || '').trim();
     if (!cleanKey) {
-      throw new Error("Grok API Key is missing. Configure it in the Parser AI tab.");
+      throw new Error("Groq / Grok API Key is missing. Configure it in the Parser AI tab.");
     }
     const isGroqCloud = cleanKey.startsWith('gsk_');
     const endpoint = isGroqCloud
       ? 'https://api.groq.com/openai/v1/chat/completions'
       : 'https://api.x.ai/v1/chat/completions';
 
-    const modelsToTry = isGroqCloud
-      ? (isVision
-          ? ['meta-llama/llama-4-scout-17b-16e-instruct', 'meta-llama/llama-4-maverick-17b-128e-instruct']
-          : ['llama-3.3-70b-versatile', 'meta-llama/llama-4-scout-17b-16e-instruct'])
-      : (isVision
-          ? [parserSettings.grokModel || 'grok-2-vision-latest', 'grok-2-vision-1212', 'grok-4-latest']
-          : [parserSettings.grokModel || 'grok-2-vision-latest', 'grok-3-mini', 'grok-2-latest']);
+    // Compress any embedded data:image URL inside messages to respect Groq's 4MB base64 limit
+    let preparedMessages = messages;
+    let extractedImageUrl = null;
+    if (isVision && Array.isArray(messages)) {
+      preparedMessages = await Promise.all(messages.map(async (m) => {
+        if (!Array.isArray(m.content)) return m;
+        const newContent = await Promise.all(m.content.map(async (part) => {
+          if (part.type === 'image_url' && part.image_url?.url) {
+            extractedImageUrl = part.image_url.url;
+            const compressed = await compressImageDataUrl(part.image_url.url);
+            extractedImageUrl = compressed;
+            return { ...part, image_url: { ...part.image_url, url: compressed } };
+          }
+          return part;
+        }));
+        return { ...m, content: newContent };
+      }));
+    }
 
-    // Deduplicate models list
-    const uniqueModels = [...new Set(modelsToTry)];
+    // Discover active models on Groq Cloud dynamically so deprecated models are skipped automatically
+    let availableModelIds = null;
+    if (isGroqCloud) {
+      try {
+        const modelsRes = await fetch('https://api.groq.com/openai/v1/models', {
+          headers: { 'Authorization': `Bearer ${cleanKey}` }
+        });
+        if (modelsRes.ok) {
+          const modelsJson = await modelsRes.json();
+          if (Array.isArray(modelsJson?.data)) {
+            availableModelIds = modelsJson.data
+              .filter(m => m.active !== false)
+              .map(m => m.id);
+          }
+        }
+      } catch (e) {
+        // Ignore discovery network warning and proceed with static list
+      }
+    }
+
+    const isVisionCapableId = (id) =>
+      /vision|vl|qwen3\.[68]|muse|pixtral|llava|scout|maverick/i.test(id) &&
+      !/whisper|tts|orpheus|guard|safeguard|embed/i.test(id);
+
+    const preferredGroqVision = [
+      parserSettings.grokModel,
+      'qwen/qwen3.8-27b',
+      'qwen/qwen3.6-27b',
+      'meta-models/muse-spark-open'
+    ].filter(id => id && isVisionCapableId(id));
+
+    const preferredGroqText = [
+      (parserSettings.grokModel && !isVisionCapableId(parserSettings.grokModel)) ? parserSettings.grokModel : null,
+      'llama-3.3-70b-versatile',
+      'openai/gpt-oss-120b',
+      'qwen/qwen3-32b',
+      'openai/gpt-oss-20b',
+      'llama-3.1-8b-instant',
+      'qwen/qwen3.8-27b',
+      'qwen/qwen3.6-27b'
+    ].filter(Boolean);
+
+    let modelsToTry = [];
+    if (isGroqCloud) {
+      if (isVision) {
+        // If user explicitly chose a Hybrid OCR + Text model (like llama-3.3-70b-versatile), skip straight to Hybrid OCR + Text
+        const forceHybridOcr = parserSettings.grokModel && /llama-3\.3|gpt-oss/i.test(parserSettings.grokModel);
+        if (!forceHybridOcr) {
+          modelsToTry = [...preferredGroqVision];
+          if (availableModelIds) {
+            const liveVision = availableModelIds.filter(isVisionCapableId);
+            modelsToTry = [...modelsToTry, ...liveVision].filter(id => availableModelIds.includes(id));
+          }
+        }
+      } else {
+        modelsToTry = [...preferredGroqText];
+        if (availableModelIds) {
+          const liveText = availableModelIds.filter(id =>
+            !/whisper|tts|orpheus|guard|safeguard|embed/i.test(id)
+          );
+          modelsToTry = [...modelsToTry, ...liveText].filter(id => availableModelIds.includes(id));
+        }
+      }
+    } else {
+      modelsToTry = isVision
+        ? [parserSettings.grokModel || 'grok-2-vision-latest', 'grok-2-vision-1212', 'grok-4-latest']
+        : [parserSettings.grokModel || 'grok-2-vision-latest', 'grok-3-mini', 'grok-2-latest'];
+    }
+
+    const uniqueModels = [...new Set(modelsToTry)].filter(Boolean);
     let lastErr = null;
 
     for (const modelName of uniqueModels) {
@@ -1036,7 +1166,7 @@ export default function Home() {
             model: modelName,
             response_format: { type: 'json_object' },
             temperature: 0.1,
-            messages
+            messages: preparedMessages
           })
         });
         if (!response.ok) {
@@ -1047,14 +1177,41 @@ export default function Home() {
         const resData = await response.json();
         const content = resData?.choices?.[0]?.message?.content?.trim();
         if (!content) throw new Error(`${modelName}: Empty response`);
-        const cleanJsonStr = content.replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim();
-        return JSON.parse(cleanJsonStr);
+        return parseJsonFromAIContent(content);
       } catch (err) {
         lastErr = err;
-        logToConsole(`Grok model ${modelName} warning (${err.message}), trying fallback...`, 'warn');
+        logToConsole(`Groq/Grok model ${modelName} note (${err.message}), trying next option...`, 'warn');
       }
     }
-    throw new Error(`Grok API failed: ${lastErr?.message}`);
+
+    // Hybrid OCR + Groq Text LLM Fallback when Vision models are unavailable or reject the image
+    if (isVision && extractedImageUrl) {
+      logToConsole("Switching to Hybrid OCR + Groq LPU Text AI extraction...", 'info');
+      const { createWorker } = await import('tesseract.js');
+      const worker = await createWorker('eng');
+      const ocrResult = await worker.recognize(extractedImageUrl);
+      await worker.terminate();
+      const ocrText = (ocrResult?.data?.text || '').trim();
+      if (!ocrText) {
+        throw new Error(`Image OCR returned empty text and vision models failed (${lastErr?.message || 'no vision model available'}).`);
+      }
+      setRawText(ocrText);
+      setShowTextSection(true);
+
+      const sysMsg = messages.find(m => m.role === 'system')?.content || 'Return ONLY a valid JSON object.';
+      const userParts = messages.find(m => m.role === 'user')?.content;
+      const userPromptText = Array.isArray(userParts)
+        ? (userParts.find(p => p.type === 'text')?.text || 'Extract the requested data into JSON.')
+        : '';
+
+      const textMessages = [
+        { role: 'system', content: sysMsg },
+        { role: 'user', content: `${userPromptText}\n\nDocument OCR Text:\n${ocrText}` }
+      ];
+      return await callGrokOrGroqAPI(cleanKey, textMessages, false);
+    }
+
+    throw new Error(`Groq/Grok API failed: ${lastErr?.message}`);
   }
 
   const handleFileDropChange = async (e) => {
@@ -4740,13 +4897,15 @@ export default function Home() {
                   </small>
                 </div>
                 <div className="form-group">
-                  <label>Preferred Vision Model</label>
+                  <label>Preferred Vision / AI Model</label>
                   <select
-                    value={parserSettings.grokModel || 'meta-llama/llama-4-scout-17b-16e-instruct'}
+                    value={parserSettings.grokModel || 'qwen/qwen3.8-27b'}
                     onChange={(e) => setParserSettings({ ...parserSettings, grokModel: e.target.value })}
                   >
-                    <option value="meta-llama/llama-4-scout-17b-16e-instruct">Llama 4 Scout 17B Vision (Groq Cloud - Fast & Accurate)</option>
-                    <option value="meta-llama/llama-4-maverick-17b-128e-instruct">Llama 4 Maverick 17B Vision (Groq Cloud - Deep Reasoning)</option>
+                    <option value="qwen/qwen3.8-27b">Qwen 3.8 27B Vision (Groq Cloud Active Default)</option>
+                    <option value="qwen/qwen3.6-27b">Qwen 3.6 27B Vision (Groq Cloud Multimodal)</option>
+                    <option value="llama-3.3-70b-versatile">Llama 3.3 70B Versatile + Hybrid OCR (Groq Cloud)</option>
+                    <option value="openai/gpt-oss-120b">GPT-OSS 120B + Hybrid OCR (Groq Cloud)</option>
                     <option value="grok-2-vision-latest">Grok 2 Vision Latest (xAI API)</option>
                   </select>
                 </div>
