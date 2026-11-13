@@ -135,6 +135,8 @@ export default function Home() {
   // File & Camera inputs
   const fileInputRef = useRef(null);
   const payListInputRef = useRef(null);
+  // Raw top-to-bottom text of the last payment list (PDF text / OCR), used to anchor row order
+  const payListSourceTextRef = useRef('');
   const cameraInputRef = useRef(null);
   const payCameraInputRef = useRef(null);
   const videoRef = useRef(null);
@@ -2702,7 +2704,7 @@ export default function Home() {
   const getProcessedInvoicesList = () => {
     const query = payInvoiceSearch.trim().toLowerCase();
     
-    let filtered = unpaidInvoices;
+    let filtered = [...unpaidInvoices];
     
     // Apply search query filter if user typed anything
     if (query) {
@@ -2811,7 +2813,21 @@ export default function Home() {
           for (let i = 1; i <= pdf.numPages; i++) {
             const page = await pdf.getPage(i);
             const textContent = await page.getTextContent();
-            text += textContent.items.map(item => item.str).join(' ') + '\n';
+            // Sort items top-to-bottom, left-to-right so table rows keep their printed order
+            const pageItems = [...(textContent.items || [])].sort((a, b) => {
+              const yDiff = b.transform[5] - a.transform[5];
+              if (Math.abs(yDiff) > 5) return yDiff;
+              return a.transform[4] - b.transform[4];
+            });
+            let lastY = null;
+            let pageText = '';
+            for (const item of pageItems) {
+              if (lastY !== null && Math.abs(item.transform[5] - lastY) > 5) pageText += '\n';
+              else if (lastY !== null) pageText += ' ';
+              pageText += item.str;
+              lastY = item.transform[5];
+            }
+            text += pageText + '\n';
           }
           
           if (text.trim().length > 10) {
@@ -2921,6 +2937,7 @@ export default function Home() {
     
     try {
       setPaymentListStatus("Calling Cloud AI for image matching...");
+      payListSourceTextRef.current = '';
       const base64Parts = dataUrl.split(',');
       const mimeType = base64Parts[0].match(/:(.*?);/)[1];
       const base64Data = base64Parts[1];
@@ -2931,7 +2948,7 @@ export default function Home() {
         extractedResult = await callGeminiWithFallback(parserSettings.geminiKey.trim(), {
           contents: [{
             parts: [
-              { text: "Analyze this payment list document. Identify the Supplier/Vendor Name (supplier), and extract all listed Tax Invoice Numbers, Bill Numbers, SO Numbers, reference codes, and line amounts (or debits). IMPORTANT: Do NOT extract the running balance or cumulative total as the amount. Extract ONLY the individual line amount or debit for that specific row. Strip trailing hyphens or dashes from invoice numbers. If a line contains both an SO number and a Tax Invoice number, extract BOTH into their respective fields. Respond ONLY with a valid JSON object matching this schema: {\"supplier\":\"Supplier Name or empty string\",\"items\":[{\"so_no\":\"SO251030089\",\"tax_invoice\":\"ST251103022\",\"amount\":32.70}]}" },
+              { text: "Analyze this payment list document. Identify the Supplier/Vendor Name (supplier), and extract all listed Tax Invoice Numbers, Bill Numbers, SO Numbers, reference codes, and line amounts (or debits). IMPORTANT: Do NOT extract the running balance or cumulative total as the amount. Extract ONLY the individual line amount or debit for that specific row. Strip trailing hyphens or dashes from invoice numbers. Keep the rows in the EXACT top-to-bottom order printed in the document (do NOT sort, group, or reorder rows) and number them in 'row_no' starting at 1. If a line contains both an SO number and a Tax Invoice number, extract BOTH into their respective fields. Respond ONLY with a valid JSON object matching this schema: {\"supplier\":\"Supplier Name or empty string\",\"items\":[{\"row_no\":1,\"so_no\":\"SO251030089\",\"tax_invoice\":\"ST251103022\",\"amount\":32.70}]}" },
               { inlineData: { mimeType, data: base64Data } }
             ]
           }],
@@ -2947,7 +2964,7 @@ export default function Home() {
         extractedResult = await callGrokOrGroqAPI(parserSettings.grokKey, [
           {
             role: 'system',
-            content: "Analyze this payment list document. Identify the Supplier/Vendor Name (supplier), and extract all listed Tax Invoice Numbers, Bill Numbers, SO Numbers, reference codes, and line amounts (or debits). IMPORTANT: Do NOT extract the running balance or cumulative total as the amount. Extract ONLY the individual line amount or debit for that specific row. Strip trailing hyphens or dashes from invoice numbers. If a line contains both an SO number and a Tax Invoice number, extract BOTH into their respective fields. Respond ONLY with a valid JSON object matching this schema: {\"supplier\":\"Supplier Name or empty string\",\"items\":[{\"so_no\":\"SO251030089\",\"tax_invoice\":\"ST251103022\",\"amount\":32.70}]}"
+            content: "Analyze this payment list document. Identify the Supplier/Vendor Name (supplier), and extract all listed Tax Invoice Numbers, Bill Numbers, SO Numbers, reference codes, and line amounts (or debits). IMPORTANT: Do NOT extract the running balance or cumulative total as the amount. Extract ONLY the individual line amount or debit for that specific row. Strip trailing hyphens or dashes from invoice numbers. Keep the rows in the EXACT top-to-bottom order printed in the document (do NOT sort, group, or reorder rows) and number them in 'row_no' starting at 1. If a line contains both an SO number and a Tax Invoice number, extract BOTH into their respective fields. Respond ONLY with a valid JSON object matching this schema: {\"supplier\":\"Supplier Name or empty string\",\"items\":[{\"row_no\":1,\"so_no\":\"SO251030089\",\"tax_invoice\":\"ST251103022\",\"amount\":32.70}]}"
           },
           {
             role: 'user',
@@ -2971,7 +2988,7 @@ export default function Home() {
               model: parserSettings.openaiModel,
               response_format: { type: 'json_object' },
               messages: [
-                { role: 'system', content: "Respond ONLY with a JSON object: { \"supplier\": \"Supplier Name\", \"items\": [{\"so_no\": \"SO251030089\", \"tax_invoice\": \"ST251103022\", \"amount\": 32.70}] }. Strip trailing dashes or hyphens from invoice codes." },
+                { role: 'system', content: "Respond ONLY with a JSON object: { \"supplier\": \"Supplier Name\", \"items\": [{\"row_no\": 1, \"so_no\": \"SO251030089\", \"tax_invoice\": \"ST251103022\", \"amount\": 32.70}] }. Strip trailing dashes or hyphens from invoice codes." },
                 { role: 'user', content: [
                   { type: 'text', text: "Analyze payment list. Extract supplier name and invoice codes/amounts without trailing dashes." },
                   { type: 'image_url', image_url: { url: dataUrl } }
@@ -2990,6 +3007,7 @@ export default function Home() {
   }
 
   async function extractInvoiceCodesFromText(text) {
+    payListSourceTextRef.current = String(text || '');
     const engineType = parserSettings.type;
     
     if (engineType === 'regex') {
@@ -3010,7 +3028,7 @@ export default function Home() {
         extractedResult = await callGeminiWithFallback(parserSettings.geminiKey.trim(), {
           contents: [{
             parts: [{
-              text: `Analyze this payment list text. Identify the Supplier/Vendor Name (supplier), and extract all listed Tax Invoice Numbers, Bill Numbers, SO Numbers, reference codes, and line amounts (or debits). IMPORTANT: Do NOT extract the running balance or cumulative total as the amount. Extract ONLY the individual line amount or debit for that specific row. Strip trailing hyphens or dashes from invoice numbers. If a line contains both an SO number and a Tax Invoice number, extract BOTH into their respective fields. Respond ONLY with a valid JSON object matching this schema: {\"supplier\":\"Supplier Name or empty string\",\"items\":[{\"so_no\":\"SO251030089\",\"tax_invoice\":\"ST251103022\",\"amount\":32.70}]}\n\nPayment List Text:\n${text}`
+              text: `Analyze this payment list text. Identify the Supplier/Vendor Name (supplier), and extract all listed Tax Invoice Numbers, Bill Numbers, SO Numbers, reference codes, and line amounts (or debits). IMPORTANT: Do NOT extract the running balance or cumulative total as the amount. Extract ONLY the individual line amount or debit for that specific row. Strip trailing hyphens or dashes from invoice numbers. Keep the rows in the EXACT top-to-bottom order printed in the document (do NOT sort, group, or reorder rows) and number them in 'row_no' starting at 1. If a line contains both an SO number and a Tax Invoice number, extract BOTH into their respective fields. Respond ONLY with a valid JSON object matching this schema: {\"supplier\":\"Supplier Name or empty string\",\"items\":[{\"row_no\":1,\"so_no\":\"SO251030089\",\"tax_invoice\":\"ST251103022\",\"amount\":32.70}]}\n\nPayment List Text:\n${text}`
             }]
           }],
           safetySettings: [
@@ -3025,7 +3043,7 @@ export default function Home() {
         extractedResult = await callGrokOrGroqAPI(parserSettings.grokKey, [
           {
             role: 'system',
-            content: "Analyze this payment list text. Identify the Supplier/Vendor Name (supplier), and extract all listed Tax Invoice Numbers, Bill Numbers, SO Numbers, reference codes, and line amounts (or debits). IMPORTANT: Do NOT extract the running balance or cumulative total as the amount. Extract ONLY the individual line amount or debit for that specific row. Strip trailing hyphens or dashes from invoice numbers. If a line contains both an SO number and a Tax Invoice number, extract BOTH into their respective fields. Respond ONLY with a valid JSON object matching this schema: {\"supplier\":\"Supplier Name or empty string\",\"items\":[{\"so_no\":\"SO251030089\",\"tax_invoice\":\"ST251103022\",\"amount\":32.70}]}"
+            content: "Analyze this payment list text. Identify the Supplier/Vendor Name (supplier), and extract all listed Tax Invoice Numbers, Bill Numbers, SO Numbers, reference codes, and line amounts (or debits). IMPORTANT: Do NOT extract the running balance or cumulative total as the amount. Extract ONLY the individual line amount or debit for that specific row. Strip trailing hyphens or dashes from invoice numbers. Keep the rows in the EXACT top-to-bottom order printed in the document (do NOT sort, group, or reorder rows) and number them in 'row_no' starting at 1. If a line contains both an SO number and a Tax Invoice number, extract BOTH into their respective fields. Respond ONLY with a valid JSON object matching this schema: {\"supplier\":\"Supplier Name or empty string\",\"items\":[{\"row_no\":1,\"so_no\":\"SO251030089\",\"tax_invoice\":\"ST251103022\",\"amount\":32.70}]}"
           },
           {
             role: 'user',
@@ -3046,7 +3064,7 @@ export default function Home() {
               model: parserSettings.openaiModel,
               response_format: { type: 'json_object' },
               messages: [
-                { role: 'system', content: "Respond ONLY with a JSON object: { \"supplier\": \"Supplier Name\", \"items\": [{\"so_no\": \"SO251030089\", \"tax_invoice\": \"ST251103022\", \"amount\": 32.70}] }" },
+                { role: 'system', content: "Respond ONLY with a JSON object: { \"supplier\": \"Supplier Name\", \"items\": [{\"row_no\": 1, \"so_no\": \"SO251030089\", \"tax_invoice\": \"ST251103022\", \"amount\": 32.70}] }" },
                 { role: 'user', content: `Extract supplier name and invoice codes/amounts without trailing hyphens:\n${text}` }
               ]
             })
@@ -3159,18 +3177,21 @@ export default function Home() {
     rawItems.forEach(it => {
       if (typeof it === 'object' && it !== null) {
         let amtRaw = String(it.amount || it.grand_total || it.outstanding_amount || it.debit || 0);
-        // Remove commas from numbers (e.g. "1,058.39" -> "1058.39")
-        amtRaw = amtRaw.replace(/,/g, '');
+        // Remove commas / currency symbols from numbers (e.g. "$1,058.39" -> "1058.39")
+        amtRaw = amtRaw.replace(/[^0-9.-]/g, '');
         const amtNum = parseFloat(amtRaw);
+        const rowNoRaw = it.row_no ?? it.row ?? it.no ?? it.sn ?? it.index;
+        const rowNo = rowNoRaw !== undefined && rowNoRaw !== null && /^\d+$/.test(String(rowNoRaw).trim()) ? parseInt(String(rowNoRaw).trim(), 10) : null;
+        const skipKeys = new Set(['amount', 'grand_total', 'outstanding_amount', 'debit', 'credit', 'balance', 'date', '_ocrText', '_sourceText', 'row_no', 'row', 'no', 'sn', 'index', 'page']);
         
         // Extract all candidate string properties, prioritizing SO numbers first, then ST / Tax Invoice numbers second
         const soStrings = [];
         const stStrings = [];
         const otherStrings = [];
         Object.keys(it).forEach(k => {
-          if (k !== 'amount' && k !== 'grand_total' && k !== 'outstanding_amount' && k !== 'debit' && k !== 'credit' && k !== 'balance' && k !== 'date' && k !== '_ocrText') {
+          if (!skipKeys.has(k)) {
             const val = String(it[k] || '').trim();
-            if (!val) return;
+            if (!val || /^\d+\.\d+$/.test(val) || /^\d{1,3}$/.test(val)) return;
             const lowerK = k.toLowerCase();
             if (lowerK.includes('so') || /^so/i.test(val)) {
               soStrings.push(val);
@@ -3212,7 +3233,7 @@ export default function Home() {
         });
 
         if (rowTokens.length > 0 || (!isNaN(amtNum) && amtNum > 0)) {
-          parsedRows.push({ tokens: rowTokens, swapped: rowSwapped, amount: amtNum, matchedInvName: null });
+          parsedRows.push({ tokens: rowTokens, swapped: rowSwapped, amount: amtNum, rowNo, matchedInvName: null });
         }
       } else if (it !== null && it !== undefined) {
         const str = String(it).trim();
@@ -3236,7 +3257,7 @@ export default function Home() {
             swappedTokens.push(swapObj);
             rowSwapped.push(swapObj);
           }
-          parsedRows.push({ tokens: [tokObj], swapped: rowSwapped, amount: NaN, matchedInvName: null });
+          parsedRows.push({ tokens: [tokObj], swapped: rowSwapped, amount: NaN, rowNo: null, matchedInvName: null });
         }
       }
     });
@@ -3251,12 +3272,48 @@ export default function Home() {
     logToConsole(`Matching ${codeTokens.length} code token(s) against ${currentUnpaid.length} unpaid invoices...`, 'info');
     setPaymentListCodes(codeTokens.map(t => t.original));
     
+    // --- Keep rows in the exact top-to-bottom sequence of the payment list ---
+    // 1) If the AI numbered the rows (row_no), sort by that number
+    if (parsedRows.length > 1 && parsedRows.every(r => Number.isInteger(r.rowNo))) {
+      parsedRows.forEach((r, i) => { r._origIdx = i; });
+      parsedRows.sort((a, b) => (a.rowNo - b.rowNo) || (a._origIdx - b._origIdx));
+    }
+    // 2) If we have the raw document text (PDF text / OCR), anchor each row to the line where its SO/ST code is printed
+    const sourceText = payListSourceTextRef.current || (extractedData && typeof extractedData === 'object' ? (extractedData._ocrText || '') : '');
+    if (sourceText && parsedRows.length > 1) {
+      const lineNorms = String(sourceText).split(/\r?\n/).map(l => normalizeSoStDigits(l.toLowerCase().replace(/[^a-z0-9]/g, '')));
+      const fullNorm = lineNorms.join('|');
+      const findPos = (row) => {
+        let best = -1;
+        row.tokens.forEach(tok => {
+          if (!tok.norm || tok.norm.length < 6) return;
+          const idx = fullNorm.indexOf(tok.norm);
+          if (idx !== -1 && (best === -1 || idx < best)) best = idx;
+        });
+        return best;
+      };
+      const positions = parsedRows.map(findPos);
+      const foundCount = positions.filter(p => p !== -1).length;
+      if (foundCount >= Math.ceil(parsedRows.length * 0.6)) {
+        // Rows not found in text inherit the position of the previous found row (keeps their relative place)
+        let carry = -1;
+        const keyed = parsedRows.map((row, i) => {
+          if (positions[i] !== -1) carry = positions[i];
+          return { row, key: positions[i] !== -1 ? positions[i] : carry + 0.5, i };
+        });
+        keyed.sort((a, b) => (a.key - b.key) || (a.i - b.i));
+        parsedRows.splice(0, parsedRows.length, ...keyed.map(k => k.row));
+        logToConsole(`Row order anchored to document text (${foundCount}/${keyed.length} rows located).`, 'info');
+      }
+    }
+
     const nextChecks = {};
     const matchedSeq = [];
     let matchedCount = 0;
     let sum = 0;
 
-    const isTokenMatchInv = (tok, inv) => {
+    // mode: 'exact' = bill_no / invoice ID must equal the token; 'partial' = substring match (min 5 chars)
+    const isTokenMatchInv = (tok, inv, mode = 'partial') => {
       const isNumeric = /^\d+$/.test(tok.norm);
       if (isNumeric && tok.norm.length < 4) return false;
       const invId = inv.name.toLowerCase();
@@ -3264,51 +3321,42 @@ export default function Home() {
       const billNo = (inv.bill_no || '').toLowerCase();
       const billNoNorm = normalizeSoStDigits(billNo.replace(/[^a-z0-9]/g, ''));
 
-      if (tok.norm.length >= 3) {
-        if (invIdNorm.includes(tok.norm) || tok.norm.includes(invIdNorm)) return true;
-        if (billNoNorm && (billNoNorm.includes(tok.norm) || tok.norm.includes(billNoNorm))) return true;
+      if (mode === 'exact') {
+        return (billNoNorm && billNoNorm === tok.norm) || invIdNorm === tok.norm;
       }
-      if (tok.original && tok.original.length >= 4) {
-        if (invId.includes(tok.original) || tok.original.includes(invId)) return true;
-        if (billNo && (billNo.includes(tok.original) || tok.original.includes(billNo))) return true;
+      if (tok.norm.length >= 5) {
+        if (billNoNorm && billNoNorm.length >= 5 && (billNoNorm.includes(tok.norm) || tok.norm.includes(billNoNorm))) return true;
+        if (invIdNorm.includes(tok.norm) || tok.norm.includes(invIdNorm)) return true;
+      }
+      if (tok.original && tok.original.length >= 5) {
+        if (billNo && billNo.length >= 5 && (billNo.includes(tok.original) || tok.original.includes(billNo))) return true;
       }
       return false;
     };
 
-    // Pass 1: Row-by-row exact/substring matching (checks SO first, then ST Tax Invoice second for each row)
-    parsedRows.forEach(row => {
-      for (const tok of row.tokens) {
-        for (const inv of currentUnpaid) {
-          if (nextChecks[inv.name]) continue;
-          if (isTokenMatchInv(tok, inv)) {
-            nextChecks[inv.name] = true;
-            row.matchedInvName = inv.name;
-            matchedCount++;
-            sum += inv.outstanding_amount;
-            break;
-          }
-        }
-        if (row.matchedInvName) break;
-      }
-    });
-
-    // Pass 2: For any unmatched row, check SO <-> ST prefix counterparts
-    parsedRows.forEach(row => {
+    const tryMatchRow = (row, tokens, mode) => {
       if (row.matchedInvName) return;
-      for (const tok of row.swapped) {
+      for (const tok of tokens) {
         for (const inv of currentUnpaid) {
           if (nextChecks[inv.name]) continue;
-          if (isTokenMatchInv(tok, inv)) {
+          if (isTokenMatchInv(tok, inv, mode)) {
             nextChecks[inv.name] = true;
             row.matchedInvName = inv.name;
             matchedCount++;
             sum += inv.outstanding_amount;
-            break;
+            return;
           }
         }
-        if (row.matchedInvName) break;
       }
-    });
+    };
+
+    // Pass 1a: exact SO (then ST) match for every row; Pass 1b: partial match for remaining rows
+    parsedRows.forEach(row => tryMatchRow(row, row.tokens, 'exact'));
+    parsedRows.forEach(row => tryMatchRow(row, row.tokens, 'partial'));
+
+    // Pass 2: For any unmatched row, check SO <-> ST prefix counterparts (exact first, then partial)
+    parsedRows.forEach(row => tryMatchRow(row, row.swapped, 'exact'));
+    parsedRows.forEach(row => tryMatchRow(row, row.swapped, 'partial'));
 
     // Pass 3: For any still-unmatched row (e.g. when Groq only extracted SO... on a row that was entered under ST... in ERPNext),
     // match against remaining unchecked ST.../SO... unpaid invoices that have the exact same line amount
@@ -3342,35 +3390,30 @@ export default function Home() {
       }
     });
 
-    // Also run flat codeTokens & itemPairs pass in case multiple invoices were grouped on one row
-    codeTokens.forEach(tok => {
-      currentUnpaid.forEach(inv => {
-        if (nextChecks[inv.name]) return;
-        if (isTokenMatchInv(tok, inv)) {
-          nextChecks[inv.name] = true;
-          matchedSeq.push(inv.name);
-          matchedCount++;
-          sum += inv.outstanding_amount;
-        }
+    // Extra pass: a row may list more than one invoice code. Only exact matches are added (appended after the rows).
+    parsedRows.forEach(row => {
+      row.tokens.forEach(tok => {
+        currentUnpaid.forEach(inv => {
+          if (nextChecks[inv.name]) return;
+          if (isTokenMatchInv(tok, inv, 'exact')) {
+            nextChecks[inv.name] = true;
+            matchedSeq.push(inv.name);
+            matchedCount++;
+            sum += inv.outstanding_amount;
+          }
+        });
       });
     });
 
-    itemPairs.forEach(pair => {
-      currentUnpaid.forEach(inv => {
-        if (nextChecks[inv.name]) return;
-        const invIdNorm = inv.name.toLowerCase().replace(/[^a-z0-9]/g, '');
-        const billNoNorm = (inv.bill_no || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-
-        const cMatch = pair.codeNorm.length >= 3 && (invIdNorm.includes(pair.codeNorm) || (billNoNorm && billNoNorm.includes(pair.codeNorm)));
-        
-        if (cMatch) {
-          nextChecks[inv.name] = true;
-          matchedSeq.push(inv.name);
-          matchedCount++;
-          sum += inv.outstanding_amount;
-        }
-      });
+    // Re-order the unpaid list so checked invoices appear in the exact payment list sequence
+    const seqIndex = new Map(matchedSeq.map((n, i) => [n, i]));
+    const reorderedUnpaid = [...currentUnpaid].sort((a, b) => {
+      const ia = seqIndex.has(a.name) ? seqIndex.get(a.name) : Infinity;
+      const ib = seqIndex.has(b.name) ? seqIndex.get(b.name) : Infinity;
+      return ia === ib ? 0 : ia - ib;
     });
+    setUnpaidInvoices(reorderedUnpaid);
+    logToConsole(`Payment list sequence: ${matchedSeq.map((n, i) => `${i + 1}. ${n}`).join(', ')}`, 'info');
 
     setCheckedInvoiceIds(nextChecks);
     setMatchedInvoiceSequence(matchedSeq);
