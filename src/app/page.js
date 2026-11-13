@@ -2948,7 +2948,7 @@ export default function Home() {
         extractedResult = await callGeminiWithFallback(parserSettings.geminiKey.trim(), {
           contents: [{
             parts: [
-              { text: "Analyze this payment list document. Identify the Supplier/Vendor Name (supplier), and extract all listed Tax Invoice Numbers, Bill Numbers, SO Numbers, reference codes, and line amounts (or debits). IMPORTANT: Do NOT extract the running balance or cumulative total as the amount. Extract ONLY the individual line amount or debit for that specific row. Strip trailing hyphens or dashes from invoice numbers. Keep the rows in the EXACT top-to-bottom order printed in the document (do NOT sort, group, or reorder rows) and number them in 'row_no' starting at 1. If a line contains both an SO number and a Tax Invoice number, extract BOTH into their respective fields. Respond ONLY with a valid JSON object matching this schema: {\"supplier\":\"Supplier Name or empty string\",\"items\":[{\"row_no\":1,\"so_no\":\"SO251030089\",\"tax_invoice\":\"ST251103022\",\"amount\":32.70}]}" },
+              { text: "Analyze this payment list document. Identify the Supplier/Vendor Name (supplier), and extract all listed Tax Invoice Numbers, Bill Numbers, SO Numbers, reference codes, and line amounts (or debits). IMPORTANT: Do NOT extract the running balance or cumulative total as the amount. Extract ONLY the individual line amount or debit for that specific row. Strip trailing hyphens or dashes from invoice numbers. Keep rows in top-to-bottom order. If a line contains both an SO number and a Tax Invoice number, extract BOTH into their respective fields. Respond ONLY with a valid JSON object matching this schema: {\"supplier\":\"Supplier Name or empty string\",\"items\":[{\"so_no\":\"SO251030089\",\"tax_invoice\":\"ST251103022\",\"amount\":32.70}]}" },
               { inlineData: { mimeType, data: base64Data } }
             ]
           }],
@@ -2964,7 +2964,7 @@ export default function Home() {
         extractedResult = await callGrokOrGroqAPI(parserSettings.grokKey, [
           {
             role: 'system',
-            content: "Analyze this payment list document. Identify the Supplier/Vendor Name (supplier), and extract all listed Tax Invoice Numbers, Bill Numbers, SO Numbers, reference codes, and line amounts (or debits). IMPORTANT: Do NOT extract the running balance or cumulative total as the amount. Extract ONLY the individual line amount or debit for that specific row. Strip trailing hyphens or dashes from invoice numbers. Keep the rows in the EXACT top-to-bottom order printed in the document (do NOT sort, group, or reorder rows) and number them in 'row_no' starting at 1. If a line contains both an SO number and a Tax Invoice number, extract BOTH into their respective fields. Respond ONLY with a valid JSON object matching this schema: {\"supplier\":\"Supplier Name or empty string\",\"items\":[{\"row_no\":1,\"so_no\":\"SO251030089\",\"tax_invoice\":\"ST251103022\",\"amount\":32.70}]}"
+            content: "Analyze this payment list document. Identify the Supplier/Vendor Name (supplier), and extract all listed Tax Invoice Numbers, Bill Numbers, SO Numbers, reference codes, and line amounts (or debits). IMPORTANT: Do NOT extract the running balance or cumulative total as the amount. Extract ONLY the individual line amount or debit for that specific row. Strip trailing hyphens or dashes from invoice numbers. Keep rows in top-to-bottom order. If a line contains both an SO number and a Tax Invoice number, extract BOTH into their respective fields. Respond ONLY with a valid JSON object matching this schema: {\"supplier\":\"Supplier Name or empty string\",\"items\":[{\"so_no\":\"SO251030089\",\"tax_invoice\":\"ST251103022\",\"amount\":32.70}]}"
           },
           {
             role: 'user',
@@ -2988,7 +2988,7 @@ export default function Home() {
               model: parserSettings.openaiModel,
               response_format: { type: 'json_object' },
               messages: [
-                { role: 'system', content: "Respond ONLY with a JSON object: { \"supplier\": \"Supplier Name\", \"items\": [{\"row_no\": 1, \"so_no\": \"SO251030089\", \"tax_invoice\": \"ST251103022\", \"amount\": 32.70}] }. Strip trailing dashes or hyphens from invoice codes." },
+                { role: 'system', content: "Respond ONLY with a JSON object: { \"supplier\": \"Supplier Name\", \"items\": [{\"so_no\": \"SO251030089\", \"tax_invoice\": \"ST251103022\", \"amount\": 32.70}] }. Strip trailing dashes or hyphens from invoice codes." },
                 { role: 'user', content: [
                   { type: 'text', text: "Analyze payment list. Extract supplier name and invoice codes/amounts without trailing dashes." },
                   { type: 'image_url', image_url: { url: dataUrl } }
@@ -3028,7 +3028,7 @@ export default function Home() {
         extractedResult = await callGeminiWithFallback(parserSettings.geminiKey.trim(), {
           contents: [{
             parts: [{
-              text: `Analyze this payment list text. Identify the Supplier/Vendor Name (supplier), and extract all listed Tax Invoice Numbers, Bill Numbers, SO Numbers, reference codes, and line amounts (or debits). IMPORTANT: Do NOT extract the running balance or cumulative total as the amount. Extract ONLY the individual line amount or debit for that specific row. Strip trailing hyphens or dashes from invoice numbers. Keep the rows in the EXACT top-to-bottom order printed in the document (do NOT sort, group, or reorder rows) and number them in 'row_no' starting at 1. If a line contains both an SO number and a Tax Invoice number, extract BOTH into their respective fields. Respond ONLY with a valid JSON object matching this schema: {\"supplier\":\"Supplier Name or empty string\",\"items\":[{\"row_no\":1,\"so_no\":\"SO251030089\",\"tax_invoice\":\"ST251103022\",\"amount\":32.70}]}\n\nPayment List Text:\n${text}`
+              text: `Analyze this payment list text. Identify the Supplier/Vendor Name (supplier), and extract all listed Tax Invoice Numbers, Bill Numbers, SO Numbers, reference codes, and line amounts (or debits). IMPORTANT: Do NOT extract the running balance or cumulative total as the amount. Extract ONLY the individual line amount or debit for that specific row. Strip trailing hyphens or dashes from invoice numbers. Keep rows in top-to-bottom order. If a line contains both an SO number and a Tax Invoice number, extract BOTH into their respective fields. Respond ONLY with a valid JSON object matching this schema: {\"supplier\":\"Supplier Name or empty string\",\"items\":[{\"so_no\":\"SO251030089\",\"tax_invoice\":\"ST251103022\",\"amount\":32.70}]}\n\nPayment List Text:\n${text}`
             }]
           }],
           safetySettings: [
@@ -3043,7 +3043,7 @@ export default function Home() {
         extractedResult = await callGrokOrGroqAPI(parserSettings.grokKey, [
           {
             role: 'system',
-            content: "Analyze this payment list text. Identify the Supplier/Vendor Name (supplier), and extract all listed Tax Invoice Numbers, Bill Numbers, SO Numbers, reference codes, and line amounts (or debits). IMPORTANT: Do NOT extract the running balance or cumulative total as the amount. Extract ONLY the individual line amount or debit for that specific row. Strip trailing hyphens or dashes from invoice numbers. Keep the rows in the EXACT top-to-bottom order printed in the document (do NOT sort, group, or reorder rows) and number them in 'row_no' starting at 1. If a line contains both an SO number and a Tax Invoice number, extract BOTH into their respective fields. Respond ONLY with a valid JSON object matching this schema: {\"supplier\":\"Supplier Name or empty string\",\"items\":[{\"row_no\":1,\"so_no\":\"SO251030089\",\"tax_invoice\":\"ST251103022\",\"amount\":32.70}]}"
+            content: "Analyze this payment list text. Identify the Supplier/Vendor Name (supplier), and extract all listed Tax Invoice Numbers, Bill Numbers, SO Numbers, reference codes, and line amounts (or debits). IMPORTANT: Do NOT extract the running balance or cumulative total as the amount. Extract ONLY the individual line amount or debit for that specific row. Strip trailing hyphens or dashes from invoice numbers. Keep rows in top-to-bottom order. If a line contains both an SO number and a Tax Invoice number, extract BOTH into their respective fields. Respond ONLY with a valid JSON object matching this schema: {\"supplier\":\"Supplier Name or empty string\",\"items\":[{\"so_no\":\"SO251030089\",\"tax_invoice\":\"ST251103022\",\"amount\":32.70}]}"
           },
           {
             role: 'user',
@@ -3064,7 +3064,7 @@ export default function Home() {
               model: parserSettings.openaiModel,
               response_format: { type: 'json_object' },
               messages: [
-                { role: 'system', content: "Respond ONLY with a JSON object: { \"supplier\": \"Supplier Name\", \"items\": [{\"row_no\": 1, \"so_no\": \"SO251030089\", \"tax_invoice\": \"ST251103022\", \"amount\": 32.70}] }" },
+                { role: 'system', content: "Respond ONLY with a JSON object: { \"supplier\": \"Supplier Name\", \"items\": [{\"so_no\": \"SO251030089\", \"tax_invoice\": \"ST251103022\", \"amount\": 32.70}] }" },
                 { role: 'user', content: `Extract supplier name and invoice codes/amounts without trailing hyphens:\n${text}` }
               ]
             })
@@ -3324,12 +3324,13 @@ export default function Home() {
       if (mode === 'exact') {
         return (billNoNorm && billNoNorm === tok.norm) || invIdNorm === tok.norm;
       }
-      if (tok.norm.length >= 5) {
-        if (billNoNorm && billNoNorm.length >= 5 && (billNoNorm.includes(tok.norm) || tok.norm.includes(billNoNorm))) return true;
+      if (tok.norm.length >= 3) {
+        if (billNoNorm && (billNoNorm.includes(tok.norm) || tok.norm.includes(billNoNorm))) return true;
         if (invIdNorm.includes(tok.norm) || tok.norm.includes(invIdNorm)) return true;
       }
-      if (tok.original && tok.original.length >= 5) {
-        if (billNo && billNo.length >= 5 && (billNo.includes(tok.original) || tok.original.includes(billNo))) return true;
+      if (tok.original && tok.original.length >= 4) {
+        if (invId.includes(tok.original) || tok.original.includes(invId)) return true;
+        if (billNo && (billNo.includes(tok.original) || tok.original.includes(billNo))) return true;
       }
       return false;
     };
@@ -3390,17 +3391,19 @@ export default function Home() {
       }
     });
 
-    // Extra pass: a row may list more than one invoice code. Only exact matches are added (appended after the rows).
-    parsedRows.forEach(row => {
-      row.tokens.forEach(tok => {
-        currentUnpaid.forEach(inv => {
-          if (nextChecks[inv.name]) return;
-          if (isTokenMatchInv(tok, inv, 'exact')) {
-            nextChecks[inv.name] = true;
-            matchedSeq.push(inv.name);
-            matchedCount++;
-            sum += inv.outstanding_amount;
-          }
+    // Extra pass: a row may list more than one invoice code (check exact first, then partial).
+    ['exact', 'partial'].forEach(mode => {
+      parsedRows.forEach(row => {
+        row.tokens.forEach(tok => {
+          currentUnpaid.forEach(inv => {
+            if (nextChecks[inv.name]) return;
+            if (isTokenMatchInv(tok, inv, mode)) {
+              nextChecks[inv.name] = true;
+              matchedSeq.push(inv.name);
+              matchedCount++;
+              sum += inv.outstanding_amount;
+            }
+          });
         });
       });
     });
