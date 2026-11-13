@@ -1022,11 +1022,11 @@ export default function Home() {
     }
   }
 
-  // Helper: Compress/resize base64 dataUrl image so it stays well under Groq's 4MB base64 limit
-  async function compressImageDataUrl(dataUrl, maxDim = 1800, quality = 0.85) {
+  // Helper: Compress/resize base64 dataUrl image so it stays well under Groq's 4MB base64 limit while keeping table text sharp
+  async function compressImageDataUrl(dataUrl, maxDim = 2200, quality = 0.90) {
     if (typeof window === 'undefined' || !dataUrl || !dataUrl.startsWith('data:image/')) return dataUrl;
-    // Only compress if larger than ~1.5MB or non-jpeg/png
-    if (dataUrl.length < 1500000) return dataUrl;
+    // Only compress if larger than ~2.5MB
+    if (dataUrl.length < 2500000) return dataUrl;
     return new Promise((resolve) => {
       const img = new Image();
       img.onload = () => {
@@ -1108,6 +1108,8 @@ export default function Home() {
 
     const preferredGroqVision = [
       parserSettings.grokModel,
+      'meta-llama/llama-4-scout-17b-16e-instruct',
+      'meta-llama/llama-4-maverick-17b-128e-instruct',
       'qwen/qwen3.8-27b',
       'qwen/qwen3.6-27b',
       'meta-models/muse-spark-open'
@@ -1208,7 +1210,11 @@ export default function Home() {
         { role: 'system', content: sysMsg },
         { role: 'user', content: `${userPromptText}\n\nDocument OCR Text:\n${ocrText}` }
       ];
-      return await callGrokOrGroqAPI(cleanKey, textMessages, false);
+      const parsedRes = await callGrokOrGroqAPI(cleanKey, textMessages, false);
+      if (parsedRes && typeof parsedRes === 'object') {
+        parsedRes._ocrText = ocrText;
+      }
+      return parsedRes;
     }
 
     throw new Error(`Groq/Grok API failed: ${lastErr?.message}`);
@@ -2558,7 +2564,7 @@ export default function Home() {
         ["outstanding_amount", ">", 0],
         ["status", "!=", "Paid"]
       ]);
-      const fieldsStr = JSON.stringify(["name", "posting_date", "grand_total", "outstanding_amount", "bill_no", "status"]);
+      const fieldsStr = JSON.stringify(["name", "posting_date", "grand_total", "outstanding_amount", "bill_no", "status", "remarks"]);
       const res = await erpRequest(`/api/resource/Purchase Invoice?filters=${encodeURIComponent(filterStr)}&fields=${encodeURIComponent(fieldsStr)}&order_by=posting_date%20desc&limit_page_length=1000`);
       
       const invoices = (res.data || []).filter(inv => 
@@ -2620,9 +2626,11 @@ export default function Home() {
           setPaymentListColor("var(--text-muted)");
         }
       }
+      return invoices;
     } catch (e) {
       setPaymentListStatus(`Failed to load: ${e.message}`);
       setPaymentListColor("var(--status-error)");
+      return [];
     } finally {
       setLoadingInvoices(false);
     }
@@ -2898,6 +2906,16 @@ export default function Home() {
       const base64Parts = dataUrl.split(',');
       const mimeType = base64Parts[0].match(/:(.*?);/)[1];
       const base64Data = base64Parts[1];
+
+      const paymentListPrompt =
+        "Analyze this payment list document. Identify the Supplier/Vendor Name (supplier), and extract EVERY SINGLE ROW from top to bottom without skipping any row. " +
+        "CRITICAL RULES FOR SO & ST INVOICE NUMBERS: " +
+        "1) Many payment lists have BOTH an SO Number column (starting with 'SO', e.g. 'SO251030089') AND a Tax Invoice / Bill Number column (starting with 'ST', e.g. 'ST251103022' or 'ST251103022-'). " +
+        "2) The SO number and the ST Tax Invoice number on the same row usually have DIFFERENT digits! Do NOT copy the SO digits into the ST number — read the actual 'SO...' code and the actual 'ST...' code printed on each row. " +
+        "3) If a row contains both an SO number and a Tax Invoice (ST) number, you MUST extract BOTH into 'so_no' and 'tax_invoice'. If a row has only an SO number or only a Tax Invoice (ST) number, still extract it. " +
+        "4) Strip any trailing hyphens or dashes from invoice numbers (e.g. 'ST251103022-' -> 'ST251103022'). " +
+        "5) Extract ONLY the individual line amount or debit for that specific row (do NOT extract running balance or cumulative total). " +
+        "Respond ONLY with a valid JSON object matching this schema: {\"supplier\":\"Supplier Name or empty string\",\"items\":[{\"so_no\":\"SO251030089\",\"tax_invoice\":\"ST251103022\",\"amount\":32.70}]}";
       
       let extractedResult = null;
       if (engineType === 'gemini') {
@@ -2905,7 +2923,7 @@ export default function Home() {
         extractedResult = await callGeminiWithFallback(parserSettings.geminiKey.trim(), {
           contents: [{
             parts: [
-              { text: "Analyze this payment list document. Identify the Supplier/Vendor Name (supplier), and extract all listed Tax Invoice Numbers, Bill Numbers, SO Numbers, reference codes, and line amounts (or debits). IMPORTANT: Do NOT extract the running balance or cumulative total as the amount. Extract ONLY the individual line amount or debit for that specific row. Strip trailing hyphens or dashes from invoice numbers. If a line contains both an SO number and a Tax Invoice number, extract BOTH into their respective fields. Respond ONLY with a valid JSON object matching this schema: {\"supplier\":\"Supplier Name or empty string\",\"items\":[{\"so_no\":\"SO251103022\",\"tax_invoice\":\"ST251103022\",\"amount\":32.70}]}" },
+              { text: paymentListPrompt },
               { inlineData: { mimeType, data: base64Data } }
             ]
           }],
@@ -2921,16 +2939,32 @@ export default function Home() {
         extractedResult = await callGrokOrGroqAPI(parserSettings.grokKey, [
           {
             role: 'system',
-            content: "Analyze this payment list document. Identify the Supplier/Vendor Name (supplier), and extract all listed Tax Invoice Numbers, Bill Numbers, SO Numbers, reference codes, and line amounts (or debits). IMPORTANT: Do NOT extract the running balance or cumulative total as the amount. Extract ONLY the individual line amount or debit for that specific row. Strip trailing hyphens or dashes from invoice numbers. If a line contains both an SO number and a Tax Invoice number, extract BOTH into their respective fields. Respond ONLY with a valid JSON object matching this schema: {\"supplier\":\"Supplier Name or empty string\",\"items\":[{\"so_no\":\"SO251103022\",\"tax_invoice\":\"ST251103022\",\"amount\":32.70}]}"
+            content: paymentListPrompt
           },
           {
             role: 'user',
             content: [
-              { type: 'text', text: "Analyze payment list. Extract supplier name and invoice codes/amounts without trailing dashes." },
+              { type: 'text', text: "Extract the supplier name and EVERY row's SO number (so_no starting with SO), Tax Invoice number (tax_invoice starting with ST), and line amount without trailing dashes." },
               { type: 'image_url', image_url: { url: dataUrl } }
             ]
           }
         ], true);
+
+        // If a Groq Vision model answered directly without Hybrid OCR, also run a quick local OCR pass
+        // so that any ST... or SO... code missed by the vision model is still captured via _ocrText
+        if (extractedResult && typeof extractedResult === 'object' && !extractedResult._ocrText) {
+          try {
+            const { createWorker } = await import('tesseract.js');
+            const worker = await createWorker('eng');
+            const ocrRes = await worker.recognize(dataUrl);
+            await worker.terminate();
+            if (ocrRes?.data?.text) {
+              extractedResult._ocrText = ocrRes.data.text;
+            }
+          } catch (ocrErr) {
+            // Non-fatal if supplemental OCR scan fails
+          }
+        }
       } else if (engineType === 'openai') {
         if (!parserSettings.openaiKey) throw new Error("OpenAI key missing.");
         
@@ -2945,9 +2979,9 @@ export default function Home() {
               model: parserSettings.openaiModel,
               response_format: { type: 'json_object' },
               messages: [
-                { role: 'system', content: "Respond ONLY with a JSON object: { \"supplier\": \"Supplier Name\", \"items\": [{\"code\": \"ST251103022\", \"amount\": 32.70}] }. Strip trailing dashes or hyphens from invoice codes." },
+                { role: 'system', content: paymentListPrompt },
                 { role: 'user', content: [
-                  { type: 'text', text: "Analyze payment list. Extract supplier name and invoice codes/amounts without trailing dashes." },
+                  { type: 'text', text: "Extract the supplier name and EVERY row's SO number (so_no starting with SO), Tax Invoice number (tax_invoice starting with ST), and line amount without trailing dashes." },
                   { type: 'image_url', image_url: { url: dataUrl } }
                 ]}
               ]
@@ -2978,13 +3012,23 @@ export default function Home() {
     try {
       setPaymentListStatus("Calling Cloud AI for text matching...");
       let extractedResult = null;
+
+      const paymentListTextPrompt =
+        "Analyze this payment list text. Identify the Supplier/Vendor Name (supplier), and extract EVERY SINGLE ROW from top to bottom without skipping any row. " +
+        "CRITICAL RULES FOR SO & ST INVOICE NUMBERS: " +
+        "1) Many payment lists have BOTH an SO Number column (starting with 'SO', e.g. 'SO251030089') AND a Tax Invoice / Bill Number column (starting with 'ST', e.g. 'ST251103022' or 'ST251103022-'). " +
+        "2) The SO number and the ST Tax Invoice number on the same row usually have DIFFERENT digits! Do NOT copy the SO digits into the ST number — read the actual 'SO...' code and the actual 'ST...' code on each row. " +
+        "3) If a line contains both an SO number and a Tax Invoice (ST) number, you MUST extract BOTH into 'so_no' and 'tax_invoice'. If a line has only an SO number or only a Tax Invoice (ST) number, still extract it. " +
+        "4) Strip any trailing hyphens or dashes from invoice numbers (e.g. 'ST251103022-' -> 'ST251103022'). " +
+        "5) Extract ONLY the individual line amount or debit for that specific row (do NOT extract running balance or cumulative total). " +
+        "Respond ONLY with a valid JSON object matching this schema: {\"supplier\":\"Supplier Name or empty string\",\"items\":[{\"so_no\":\"SO251030089\",\"tax_invoice\":\"ST251103022\",\"amount\":32.70}]}";
       
       if (engineType === 'gemini') {
         if (!parserSettings.geminiKey) throw new Error("Gemini Key missing.");
         extractedResult = await callGeminiWithFallback(parserSettings.geminiKey.trim(), {
           contents: [{
             parts: [{
-              text: `Analyze this payment list text. Identify the Supplier/Vendor Name (supplier), and extract all listed Tax Invoice Numbers, Bill Numbers, SO Numbers, reference codes, and line amounts (or debits). IMPORTANT: Do NOT extract the running balance or cumulative total as the amount. Extract ONLY the individual line amount or debit for that specific row. Strip trailing hyphens or dashes from invoice numbers. If a line contains both an SO number and a Tax Invoice number, extract BOTH into their respective fields. Respond ONLY with a valid JSON object matching this schema: {\"supplier\":\"Supplier Name or empty string\",\"items\":[{\"so_no\":\"SO251103022\",\"tax_invoice\":\"ST251103022\",\"amount\":32.70}]}\n\nPayment List Text:\n${text}`
+              text: `${paymentListTextPrompt}\n\nPayment List Text:\n${text}`
             }]
           }],
           safetySettings: [
@@ -2999,11 +3043,11 @@ export default function Home() {
         extractedResult = await callGrokOrGroqAPI(parserSettings.grokKey, [
           {
             role: 'system',
-            content: "Analyze this payment list text. Identify the Supplier/Vendor Name (supplier), and extract all listed Tax Invoice Numbers, Bill Numbers, SO Numbers, reference codes, and line amounts (or debits). IMPORTANT: Do NOT extract the running balance or cumulative total as the amount. Extract ONLY the individual line amount or debit for that specific row. Strip trailing hyphens or dashes from invoice numbers. Respond ONLY with a valid JSON object matching this schema: {\"supplier\":\"Supplier Name or empty string\",\"items\":[{\"so_no\":\"SO251103022\",\"tax_invoice\":\"ST251103022\",\"amount\":32.70}]}"
+            content: paymentListTextPrompt
           },
           {
             role: 'user',
-            content: `Extract supplier name and invoice codes/amounts without trailing hyphens:\n${text}`
+            content: `Extract supplier name and EVERY row's SO number (so_no) and ST Tax Invoice number (tax_invoice) without trailing hyphens:\n${text}`
           }
         ], false);
       } else if (engineType === 'openai') {
@@ -3020,12 +3064,16 @@ export default function Home() {
               model: parserSettings.openaiModel,
               response_format: { type: 'json_object' },
               messages: [
-                { role: 'system', content: "Respond ONLY with a JSON object: { \"supplier\": \"Supplier Name\", \"items\": [{\"code\": \"ST251103022\", \"amount\": 32.70}] }" },
-                { role: 'user', content: `Extract supplier name and invoice codes/amounts without trailing hyphens:\n${text}` }
+                { role: 'system', content: paymentListTextPrompt },
+                { role: 'user', content: `Extract supplier name and EVERY row's SO number (so_no) and ST Tax Invoice number (tax_invoice) without trailing hyphens:\n${text}` }
               ]
             })
           })
         );
+      }
+
+      if (extractedResult && typeof extractedResult === 'object' && !Array.isArray(extractedResult)) {
+        extractedResult._ocrText = text;
       }
       
       await matchAndCheckInvoices(extractedResult);
@@ -3038,8 +3086,10 @@ export default function Home() {
   async function matchAndCheckInvoices(extractedData) {
     let detectedSupplier = "";
     let rawItems = [];
+    let rawOcrText = "";
 
     if (typeof extractedData === 'object' && extractedData !== null) {
+      if (extractedData._ocrText) rawOcrText = String(extractedData._ocrText);
       if (extractedData.supplier) detectedSupplier = String(extractedData.supplier).trim();
       if (Array.isArray(extractedData.items)) {
         rawItems = extractedData.items;
@@ -3048,7 +3098,9 @@ export default function Home() {
       } else if (Array.isArray(extractedData)) {
         rawItems = extractedData;
       } else {
-        rawItems = Object.values(extractedData);
+        rawItems = Object.entries(extractedData)
+          .filter(([k]) => k !== '_ocrText' && k !== 'supplier')
+          .map(([, v]) => v);
       }
     } else if (Array.isArray(extractedData)) {
       rawItems = extractedData;
@@ -3098,57 +3150,179 @@ export default function Home() {
 
     // Filter out common noise tokens (years, generic words, pure numbers)
     const currentYear = new Date().getFullYear().toString();
-    const noiseWords = new Set([currentYear, "2024", "2025", "2026", "2027", "page", "total", "subtotal", "date", "amount", "invoice", "bill", "payment", "list", "no", "num", "ref", "supplier", "singapore", "pte", "ltd"]);
+    const noiseWords = new Set([currentYear, "2024", "2025", "2026", "2027", "page", "total", "subtotal", "date", "amount", "invoice", "bill", "payment", "list", "no", "num", "ref", "supplier", "singapore", "pte", "ltd", "tax", "order", "sales"]);
+
+    // Normalize an invoice/SO code token and fix common OCR prefix confusions (e.g. 5T/S7/SI -> ST, 5O/S0/50 -> SO)
+    const normalizePaymentCode = (rawStr) => {
+      let cleanCode = String(rawStr || '').trim();
+      if (isViskouSupplier || /[-_/\s]+$/.test(cleanCode)) {
+        cleanCode = cleanCode.replace(/[-_/\s]+$/, '').trim();
+      }
+      let original = cleanCode.toLowerCase();
+      let norm = original.replace(/[^a-z0-9]/g, '');
+
+      // Fix common OCR confusions on ST... and SO... prefixes when followed by 5+ digits
+      const stOcrMatch = norm.match(/^(?:5t|s7|si|st)(\d{5,})$/i);
+      if (stOcrMatch) {
+        norm = `st${stOcrMatch[1]}`;
+        original = norm;
+      } else {
+        const soOcrMatch = norm.match(/^(?:5o|s0|50|so)(\d{5,})$/i);
+        if (soOcrMatch) {
+          norm = `so${soOcrMatch[1]}`;
+          original = norm;
+        }
+      }
+      return { original, norm };
+    };
+
+    // Split a field value into individual candidate code strings in case an AI combined "SO251030089 / ST251103022-"
+    const splitCandidateCodes = (valStr) => {
+      const s = String(valStr || '').trim();
+      if (!s) return [];
+      // If string contains whitespace, commas, or slashes separating multiple tokens, extract both the parts and any SO/ST patterns
+      const parts = s.split(/[\s,;]+/).map(p => p.trim()).filter(Boolean);
+      const result = [];
+      parts.forEach(p => {
+        if (p.includes('/') && /(?:so|st|5t|s7|5o|s0)\d{5,}/i.test(p)) {
+          p.split('/').map( x => x.trim()).filter(Boolean).forEach(sub => result.push(sub));
+        } else {
+          result.push(p);
+        }
+      });
+      return result;
+    };
 
     const codeTokens = [];
     const itemPairs = [];
+    // structuredRows preserves each row's [SO tokens first, ST tokens second, other tokens third, SO<->ST prefix-swapped fallbacks fourth]
+    const structuredRows = [];
+
     rawItems.forEach(it => {
       if (typeof it === 'object' && it !== null) {
         let amtRaw = String(it.amount || it.grand_total || it.outstanding_amount || it.debit || 0);
-        // Remove commas from numbers (e.g. "1,058.39" -> "1058.39")
         amtRaw = amtRaw.replace(/,/g, '');
         const amtNum = parseFloat(amtRaw);
-        
-        // Extract all candidate string properties (code, tax_invoice, bill_no, so_no, reference, etc.)
-        const candidateStrings = [];
+
+        const rowSoTokens = [];
+        const rowStTokens = [];
+        const rowOtherTokens = [];
+
         Object.keys(it).forEach(k => {
-          if (k !== 'amount' && k !== 'grand_total' && k !== 'outstanding_amount' && k !== 'debit' && k !== 'credit' && k !== 'balance' && k !== 'date') {
-            const val = String(it[k] || '').trim();
-            if (val) candidateStrings.push(val);
+          const lowerK = k.toLowerCase();
+          if (['amount', 'grand_total', 'outstanding_amount', 'debit', 'credit', 'balance', 'date'].includes(lowerK)) {
+            return;
           }
+          const rawVal = String(it[k] || '').trim();
+          if (!rawVal) return;
+
+          const subCodes = splitCandidateCodes(rawVal);
+          subCodes.forEach(codeStr => {
+            const isPureNumber = /^\d+(\.\d+)?$/.test(codeStr);
+            if (isPureNumber) return;
+            const tok = normalizePaymentCode(codeStr);
+            if (tok.norm.length < 3 || noiseWords.has(tok.norm)) return;
+
+            if (/^so\d{4,}/.test(tok.norm) || lowerK.includes('so')) {
+              rowSoTokens.push(tok);
+            } else if (/^st\d{4,}/.test(tok.norm) || lowerK.includes('tax') || lowerK.includes('st') || lowerK.includes('inv') || lowerK.includes('bill')) {
+              rowStTokens.push(tok);
+            } else {
+              rowOtherTokens.push(tok);
+            }
+          });
         });
 
-        candidateStrings.forEach(codeStr => {
-          // For Viskou or trailing punctuation, strip trailing dashes while preserving internal dashes for other suppliers
-          let cleanCode = codeStr.trim();
-          if (isViskouSupplier || /[-_/\s]+$/.test(cleanCode)) {
-            cleanCode = cleanCode.replace(/[-_/\s]+$/, '').trim();
-          }
-          const norm = cleanCode.toLowerCase().replace(/[^a-z0-9]/g, '');
-          
-          if (norm.length >= 3 && !noiseWords.has(norm)) {
-            codeTokens.push({ original: cleanCode.toLowerCase(), norm });
-            if (!isNaN(amtNum) && amtNum > 0) {
-              itemPairs.push({ codeNorm: norm, original: cleanCode.toLowerCase(), amount: amtNum });
+        // Order for this row: SO number FIRST, then ST Tax Invoice number SECOND, then any other code
+        const orderedRowTokens = [...rowSoTokens, ...rowStTokens, ...rowOtherTokens];
+
+        // Also build SO <-> ST prefix-swapped fallback tokens for this row in case only SO or only ST was extracted
+        // and ERPNext stored the same digits under the opposite prefix (SO vs ST)
+        const rowSwappedFallbacks = [];
+        orderedRowTokens.forEach(tok => {
+          const m = tok.norm.match(/^(so|st)(\d{5,})$/);
+          if (m) {
+            const altPrefix = m[1] === 'so' ? 'st' : 'so';
+            const altNorm = `${altPrefix}${m[2]}`;
+            if (!orderedRowTokens.some(existing => existing.norm === altNorm)) {
+              rowSwappedFallbacks.push({ original: altNorm, norm: altNorm });
             }
           }
         });
+
+        if (orderedRowTokens.length > 0) {
+          structuredRows.push({
+            primaryTokens: orderedRowTokens,
+            fallbackTokens: rowSwappedFallbacks,
+            amount: amtNum
+          });
+          orderedRowTokens.forEach(tok => {
+            codeTokens.push(tok);
+            if (!isNaN(amtNum) && amtNum > 0) {
+              itemPairs.push({ codeNorm: tok.norm, original: tok.original, amount: amtNum });
+            }
+          });
+        }
       } else if (it !== null && it !== undefined) {
-        const str = String(it).trim();
-        let cleanStr = str;
-        if (isViskouSupplier || /[-_/\s]+$/.test(cleanStr)) {
-          cleanStr = cleanStr.replace(/[-_/\s]+$/, '').trim();
-        }
-        const original = cleanStr.toLowerCase();
-        const norm = original.replace(/[^a-z0-9]/g, '');
-        
-        // Skip pure numbers (amounts/years/page numbers) from being standalone code tokens
-        const isPureNumber = /^\d+(\.\d+)?$/.test(cleanStr);
-        if (!isPureNumber && norm.length >= 3 && !noiseWords.has(norm)) {
-          codeTokens.push({ original, norm });
-        }
+        const subCodes = splitCandidateCodes(String(it));
+        subCodes.forEach(cleanStr => {
+          const isPureNumber = /^\d+(\.\d+)?$/.test(cleanStr);
+          if (isPureNumber) return;
+          const tok = normalizePaymentCode(cleanStr);
+          if (tok.norm.length >= 3 && !noiseWords.has(tok.norm)) {
+            codeTokens.push(tok);
+            const m = tok.norm.match(/^(so|st)(\d{5,})$/);
+            const fallbacks = m ? [{ original: `${m[1] === 'so' ? 'st' : 'so'}${m[2]}`, norm: `${m[1] === 'so' ? 'st' : 'so'}${m[2]}` }] : [];
+            structuredRows.push({
+              primaryTokens: [tok],
+              fallbackTokens: fallbacks,
+              amount: NaN
+            });
+          }
+        });
       }
     });
+
+    // Supplement with direct regex scan of _ocrText (or rawText) for any SO... or ST... codes that the AI model might have missed
+    if (rawOcrText) {
+      const seenNorms = new Set(codeTokens.map(t => t.norm));
+      const ocrLines = rawOcrText.split(/\r?\n/);
+      ocrLines.forEach(line => {
+        const trimmedLine = line.trim();
+        if (!trimmedLine) return;
+        // Find all SO... and ST... tokens (including common OCR misreads like 5T, S7, SI, 5O, S0) on this line
+        const lineMatches = trimmedLine.match(/\b(?:SO|ST|5O|S0|5T|S7|SI)\d{5,14}[-_]*\b/gi) || [];
+        if (lineMatches.length > 0) {
+          const lineSo = [];
+          const lineSt = [];
+          lineMatches.forEach(rawMatch => {
+            const tok = normalizePaymentCode(rawMatch);
+            if (tok.norm.length >= 6 && !seenNorms.has(tok.norm)) {
+              seenNorms.add(tok.norm);
+              codeTokens.push(tok);
+              if (tok.norm.startsWith('so')) lineSo.push(tok);
+              else lineSt.push(tok);
+            }
+          });
+          const lineOrdered = [...lineSo, ...lineSt];
+          if (lineOrdered.length > 0) {
+            const lineFallbacks = [];
+            lineOrdered.forEach(tok => {
+              const m = tok.norm.match(/^(so|st)(\d{5,})$/);
+              if (m) {
+                const altNorm = `${m[1] === 'so' ? 'st' : 'so'}${m[2]}`;
+                lineFallbacks.push({ original: altNorm, norm: altNorm });
+              }
+            });
+            structuredRows.push({
+              primaryTokens: lineOrdered,
+              fallbackTokens: lineFallbacks,
+              amount: NaN
+            });
+          }
+        }
+      });
+    }
 
     if (codeTokens.length === 0 && itemPairs.length === 0) {
       setPaymentListStatus("No valid invoice numbers or bill codes found in document.");
@@ -3157,7 +3331,7 @@ export default function Home() {
       return;
     }
     
-    logToConsole(`Matching ${codeTokens.length} code token(s) against ${currentUnpaid.length} unpaid invoices...`, 'info');
+    logToConsole(`Matching ${codeTokens.length} code token(s) across ${structuredRows.length} row(s) against ${currentUnpaid.length} unpaid invoices...`, 'info');
     setPaymentListCodes(codeTokens.map(t => t.original));
     
     const nextChecks = {};
@@ -3165,49 +3339,92 @@ export default function Home() {
     let matchedCount = 0;
     let sum = 0;
 
-    // Process tokens in exact document order to preserve payment list sequence
-    codeTokens.forEach(tok => {
+    // Helper: check if an unpaid ERPNext invoice matches a single normalized token
+    const doesInvoiceMatchToken = (inv, tok) => {
+      if (!tok || !tok.norm) return false;
       const isNumeric = /^\d+$/.test(tok.norm);
-      if (isNumeric && tok.norm.length < 4) return;
+      if (isNumeric && tok.norm.length < 4) return false;
 
-      currentUnpaid.forEach(inv => {
-        if (nextChecks[inv.name]) return;
-        const invId = inv.name.toLowerCase();
-        const invIdNorm = invId.replace(/[^a-z0-9]/g, '');
-        const billNo = (inv.bill_no || '').toLowerCase();
-        const billNoNorm = billNo.replace(/[^a-z0-9]/g, '');
+      const invId = (inv.name || '').toLowerCase();
+      const invIdNorm = invId.replace(/[^a-z0-9]/g, '');
+      const billNo = (inv.bill_no || '').toLowerCase();
+      const billNoNorm = billNo.replace(/[^a-z0-9]/g, '');
+      const remarks = (inv.remarks || '').toLowerCase();
+      const remarksNorm = remarks.replace(/[^a-z0-9]/g, '');
 
-        let match = false;
-        if (tok.norm.length >= 3) {
-          if (invIdNorm.includes(tok.norm) || tok.norm.includes(invIdNorm)) match = true;
-          if (billNoNorm && (billNoNorm.includes(tok.norm) || tok.norm.includes(billNoNorm))) match = true;
-        }
-        if (tok.original.length >= 4) {
-          if (invId.includes(tok.original) || tok.original.includes(invId)) match = true;
-          if (billNo && (billNo.includes(tok.original) || tok.original.includes(billNo))) match = true;
-        }
+      if (tok.norm.length >= 3) {
+        if (invIdNorm && (invIdNorm.includes(tok.norm) || tok.norm.includes(invIdNorm))) return true;
+        if (billNoNorm && (billNoNorm.includes(tok.norm) || tok.norm.includes(billNoNorm))) return true;
+        if (tok.norm.length >= 6 && remarksNorm && remarksNorm.includes(tok.norm)) return true;
+      }
+      if (tok.original && tok.original.length >= 4) {
+        if (invId && (invId.includes(tok.original) || tok.original.includes(invId))) return true;
+        if (billNo && (billNo.includes(tok.original) || tok.original.includes(billNo))) return true;
+        if (tok.original.length >= 6 && remarks && remarks.includes(tok.original)) return true;
+      }
+      return false;
+    };
 
-        if (match) {
-          nextChecks[inv.name] = true;
-          matchedSeq.push(inv.name);
-          matchedCount++;
-          sum += inv.outstanding_amount;
+    // Process row-by-row in exact document order:
+    // For each row, check SO number first; if no match in ERPNext, check ST Tax Invoice number second;
+    // if still no match, check SO<->ST prefix-swapped fallback tokens.
+    structuredRows.forEach(row => {
+      let rowMatched = false;
+
+      // 1) Try primary tokens in order (SO first, then ST Tax Invoice, then other reference codes)
+      for (const tok of row.primaryTokens) {
+        for (const inv of currentUnpaid) {
+          if (nextChecks[inv.name]) continue;
+          if (doesInvoiceMatchToken(inv, tok)) {
+            nextChecks[inv.name] = true;
+            matchedSeq.push(inv.name);
+            matchedCount++;
+            sum += inv.outstanding_amount;
+            rowMatched = true;
+            break;
+          }
         }
-      });
+        if (rowMatched) break;
+      }
+
+      // 2) If any additional token on the same row also matches another distinct unpaid invoice (e.g. when AI grouped multiple codes), check remaining primary tokens
+      for (const tok of row.primaryTokens) {
+        for (const inv of currentUnpaid) {
+          if (nextChecks[inv.name]) continue;
+          if (doesInvoiceMatchToken(inv, tok)) {
+            nextChecks[inv.name] = true;
+            matchedSeq.push(inv.name);
+            matchedCount++;
+            sum += inv.outstanding_amount;
+            rowMatched = true;
+          }
+        }
+      }
+
+      // 3) If neither SO nor ST matched directly, try SO <-> ST prefix-swapped fallback tokens
+      if (!rowMatched && row.fallbackTokens.length > 0) {
+        for (const fbTok of row.fallbackTokens) {
+          for (const inv of currentUnpaid) {
+            if (nextChecks[inv.name]) continue;
+            if (doesInvoiceMatchToken(inv, fbTok)) {
+              nextChecks[inv.name] = true;
+              matchedSeq.push(inv.name);
+              matchedCount++;
+              sum += inv.outstanding_amount;
+              rowMatched = true;
+              break;
+            }
+          }
+          if (rowMatched) break;
+        }
+      }
     });
 
-    itemPairs.forEach(pair => {
+    // Final safety pass over all codeTokens & itemPairs in case any token wasn't matched above
+    codeTokens.forEach(tok => {
       currentUnpaid.forEach(inv => {
         if (nextChecks[inv.name]) return;
-        const invIdNorm = inv.name.toLowerCase().replace(/[^a-z0-9]/g, '');
-        const billNoNorm = (inv.bill_no || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-        const outAmt = inv.outstanding_amount;
-        const grandAmt = inv.grand_total;
-
-        const cMatch = pair.codeNorm.length >= 3 && (invIdNorm.includes(pair.codeNorm) || (billNoNorm && billNoNorm.includes(pair.codeNorm)));
-        // Relaxed amount matching per user request: only match the SO / Tax Invoice code
-        
-        if (cMatch) {
+        if (doesInvoiceMatchToken(inv, tok)) {
           nextChecks[inv.name] = true;
           matchedSeq.push(inv.name);
           matchedCount++;
@@ -3450,17 +3667,22 @@ export default function Home() {
       const mimeType = base64Parts[0].match(/:(.*?);/)?.[1] || 'image/png';
       const base64Data = base64Parts[1];
 
+      const reconPrompt =
+        "Extract EVERY invoice number, Tax Invoice number (starting with 'ST', e.g. 'ST251103022'), bill number, and Sales Order number (starting with 'SO', e.g. 'SO251030089') from EVERY row of this payment list document. " +
+        "CRITICAL: If a row has BOTH an SO number (SO...) and a Tax Invoice number (ST...) in separate columns, include BOTH numbers in the array. Strip any trailing hyphens or dashes (e.g. 'ST251103022-' -> 'ST251103022'). " +
+        "Return ONLY a valid JSON object matching this schema: {\"invoices\": [\"SO251030089\", \"ST251103022\", \"INV-001\"]}";
+
       let rawExtracted = null;
       if (parserSettings.type === 'grok' || (!parserSettings.geminiKey && parserSettings.grokKey)) {
         rawExtracted = await callGrokOrGroqAPI(parserSettings.grokKey, [
           {
             role: "system",
-            content: "Extract all invoice numbers, bill numbers, and sales order numbers from this payment list document. Return ONLY a valid JSON object matching this schema: {\"invoices\": [\"INV-001\", \"ST251103022\", \"PO-1029\"]}"
+            content: reconPrompt
           },
           {
             role: "user",
             content: [
-              { type: "text", text: "Extract all invoice, bill, and sales order numbers from this payment list." },
+              { type: "text", text: "Extract all SO numbers (SO...) and Tax Invoice / Bill numbers (ST...) from every row of this payment list without trailing dashes." },
               { type: "image_url", image_url: { url: `data:${mimeType};base64,${base64Data}` } }
             ]
           }
@@ -3478,12 +3700,12 @@ export default function Home() {
             messages: [
               {
                 role: "system",
-                content: "Extract all invoice numbers, bill numbers, and sales order numbers from this payment list document. Return ONLY a valid JSON object matching this schema: {\"invoices\": [\"INV-001\", \"ST251103022\", \"PO-1029\"]}"
+                content: reconPrompt
               },
               {
                 role: "user",
                 content: [
-                  { type: "text", text: "Extract all invoice, bill, and sales order numbers from this payment list." },
+                  { type: "text", text: "Extract all SO numbers (SO...) and Tax Invoice / Bill numbers (ST...) from every row of this payment list without trailing dashes." },
                   { type: "image_url", image_url: { url: `data:${mimeType};base64,${base64Data}` } }
                 ]
               }
@@ -3500,7 +3722,7 @@ export default function Home() {
         rawExtracted = await callGeminiWithFallback(parserSettings.geminiKey.trim(), {
           contents: [{
             parts: [
-              { text: `Extract all invoice numbers, bill numbers, and sales order numbers from this payment list document. Return ONLY a valid JSON array of strings matching this schema: ["INV-001", "ST251103022", "PO-1029"]` },
+              { text: reconPrompt },
               { inlineData: { mimeType, data: base64Data } }
             ]
           }],
@@ -3508,9 +3730,38 @@ export default function Home() {
         });
       }
 
-      const extractedInvs = Array.isArray(rawExtracted)
+      const rawList = Array.isArray(rawExtracted)
         ? rawExtracted
         : (rawExtracted?.invoices || rawExtracted?.items || []);
+
+      // Normalize extracted invoice/SO strings (strip trailing dashes and expand object items if any)
+      const cleanedSet = new Set();
+      rawList.forEach(entry => {
+        if (typeof entry === 'string') {
+          const clean = entry.trim().replace(/[-_/\s]+$/, '').trim();
+          if (clean) cleanedSet.add(clean);
+        } else if (entry && typeof entry === 'object') {
+          Object.values(entry).forEach(v => {
+            if (typeof v === 'string') {
+              const clean = v.trim().replace(/[-_/\s]+$/, '').trim();
+              if (clean && !/^\d+(\.\d+)?$/.test(clean)) cleanedSet.add(clean);
+            }
+          });
+        }
+      });
+
+      // Also supplement with any SO... or ST... codes from _ocrText if available
+      if (rawExtracted && typeof rawExtracted === 'object' && rawExtracted._ocrText) {
+        const ocrCodes = String(rawExtracted._ocrText).match(/\b(?:SO|ST|5O|S0|5T|S7|SI)\d{5,14}[-_]*\b/gi) || [];
+        ocrCodes.forEach(c => {
+          let clean = c.replace(/[-_/\s]+$/, '').toUpperCase();
+          if (/^(?:5T|S7|SI)\d{5,}$/.test(clean)) clean = 'ST' + clean.slice(2);
+          if (/^(?:5O|S0)\d{5,}$/.test(clean)) clean = 'SO' + clean.slice(2);
+          cleanedSet.add(clean);
+        });
+      }
+
+      const extractedInvs = [...cleanedSet];
 
       if (!Array.isArray(extractedInvs) || extractedInvs.length === 0) {
         setReconFileStatus("No invoice numbers were detected in the uploaded payment list.");
