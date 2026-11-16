@@ -3359,30 +3359,7 @@ export default function Home() {
     parsedRows.forEach(row => tryMatchRow(row, row.swapped, 'exact'));
     parsedRows.forEach(row => tryMatchRow(row, row.swapped, 'partial'));
 
-    // Pass 3: For any still-unmatched row (e.g. when Groq only extracted SO... on a row that was entered under ST... in ERPNext),
-    // match against remaining unchecked ST.../SO... unpaid invoices that have the exact same line amount
-    parsedRows.forEach(row => {
-      if (row.matchedInvName || isNaN(row.amount) || row.amount <= 0) return;
-      // Prioritize remaining unpaid invoices whose bill_no starts with ST or SO
-      const sortedCandidates = [...currentUnpaid].sort((a, b) => {
-        const aIsStSo = /^(?:st|so)/i.test((a.bill_no || '').trim()) ? 0 : 1;
-        const bIsStSo = /^(?:st|so)/i.test((b.bill_no || '').trim()) ? 0 : 1;
-        return aIsStSo - bIsStSo;
-      });
-      for (const inv of sortedCandidates) {
-        if (nextChecks[inv.name]) continue;
-        const outAmt = parseFloat(inv.outstanding_amount || 0);
-        const grandAmt = parseFloat(inv.grand_total || 0);
-        if (Math.abs(outAmt - row.amount) < 0.05 || Math.abs(grandAmt - row.amount) < 0.05) {
-          nextChecks[inv.name] = true;
-          row.matchedInvName = inv.name;
-          matchedCount++;
-          sum += inv.outstanding_amount;
-          logToConsole(`✓ Matched row ($${row.amount.toFixed(2)}) to ERPNext invoice ${inv.name} (bill_no: ${inv.bill_no || 'N/A'})`, 'success');
-          break;
-        }
-      }
-    });
+    // Do NOT auto-tick invoices by amount alone (e.g. duplicated amounts); they remain displayed in the list unticked.
 
     // Collect matched sequence in exact top-to-bottom row order
     parsedRows.forEach(row => {
